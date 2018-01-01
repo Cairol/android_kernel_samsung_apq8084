@@ -56,8 +56,8 @@ typedef __u64 binder_uintptr_t;
  */
 struct flat_binder_object {
 	/* 8 bytes for large_flat_header. */
-	__u32		type;
-	__u32		flags;
+	__u32				type;
+	__u32				flags;
 
 	/* 8 bytes of data. */
 	union {
