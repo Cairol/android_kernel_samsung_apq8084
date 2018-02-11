@@ -98,7 +98,7 @@
 #define TDLS_INIT_DONE         (6)
 
 /** Maximum time(ms)to wait for disconnect to complete **/
-#define WLAN_WAIT_TIME_DISCONNECT  2000
+#define WLAN_WAIT_TIME_DISCONNECT  5000
 #define WLAN_WAIT_TIME_STATS       800
 #define WLAN_WAIT_TIME_POWER       800
 #define WLAN_WAIT_TIME_COUNTRY     1000
@@ -218,6 +218,8 @@
 #define HDD_MAX_TX_POWER (+100)  // maximum tx power
 
 typedef v_U8_t tWlanHddMacAddr[HDD_MAC_ADDR_LEN];
+
+#define MAX_PROBE_REQ_OUIS 16
 
 /*
  * Generic asynchronous request/response support
@@ -1478,6 +1480,9 @@ struct hdd_context_s
 #endif
     /* IPv4 notifier callback for handling ARP offload on change in IP */
     struct notifier_block ipv4_notifier;
+
+    uint32_t no_of_probe_req_ouis;
+    struct vendor_oui *probe_req_voui;
 };
 
 /*---------------------------------------------------------------------------

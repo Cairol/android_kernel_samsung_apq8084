@@ -1401,6 +1401,49 @@ wlan_hdd_cfg80211_get_supported_features(struct wiphy *wiphy,
 }
 
 /**
+ * wlan_hdd_fill_whitelist_ie_attrs - fill the white list members
+ * @ie_whitelist: enables whitelist
+ * @probe_req_ie_bitmap: bitmap to be filled
+ * @num_vendor_oui: pointer to no of ouis
+ * @voui: pointer to ouis to be filled
+ * @pHddCtx: pointer to hdd ctx
+ *
+ * This function fills the ie bitmap and vendor oui fields with the
+ * corresponding values present in cfg_ini and PHddCtx
+ *
+ * Return:   Return none
+ */
+static void wlan_hdd_fill_whitelist_ie_attrs(bool *ie_whitelist,
+					     uint32_t *probe_req_ie_bitmap,
+					     uint32_t *num_vendor_oui,
+					     struct vendor_oui *voui,
+					     hdd_context_t *pHddCtx)
+{
+	uint32_t i = 0;
+
+	*ie_whitelist = true;
+	probe_req_ie_bitmap[0] = pHddCtx->cfg_ini->probe_req_ie_bitmap_0;
+	probe_req_ie_bitmap[1] = pHddCtx->cfg_ini->probe_req_ie_bitmap_1;
+	probe_req_ie_bitmap[2] = pHddCtx->cfg_ini->probe_req_ie_bitmap_2;
+	probe_req_ie_bitmap[3] = pHddCtx->cfg_ini->probe_req_ie_bitmap_3;
+	probe_req_ie_bitmap[4] = pHddCtx->cfg_ini->probe_req_ie_bitmap_4;
+	probe_req_ie_bitmap[5] = pHddCtx->cfg_ini->probe_req_ie_bitmap_5;
+	probe_req_ie_bitmap[6] = pHddCtx->cfg_ini->probe_req_ie_bitmap_6;
+	probe_req_ie_bitmap[7] = pHddCtx->cfg_ini->probe_req_ie_bitmap_7;
+
+	*num_vendor_oui = 0;
+
+	if ((pHddCtx->no_of_probe_req_ouis != 0) && (voui != NULL)) {
+		*num_vendor_oui = pHddCtx->no_of_probe_req_ouis;
+		for (i = 0; i < pHddCtx->no_of_probe_req_ouis; i++) {
+			voui[i].oui_type = pHddCtx->probe_req_voui[i].oui_type;
+			voui[i].oui_subtype =
+					pHddCtx->probe_req_voui[i].oui_subtype;
+		}
+	}
+}
+
+/**
  * __wlan_hdd_cfg80211_set_scanning_mac_oui() - set scan MAC
  * @wiphy:   pointer to wireless wiphy structure.
  * @wdev:    pointer to wireless_dev structure.
@@ -1422,6 +1465,8 @@ __wlan_hdd_cfg80211_set_scanning_mac_oui(struct wiphy *wiphy,
     struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_SET_SCANNING_MAC_OUI_MAX + 1];
     eHalStatus status;
     int ret;
+    struct net_device *ndev = wdev->netdev;
+    hdd_adapter_t *pAdapter = WLAN_HDD_GET_PRIV_PTR(ndev);
 
     ENTER();
 
@@ -1443,11 +1488,16 @@ __wlan_hdd_cfg80211_set_scanning_mac_oui(struct wiphy *wiphy,
         return -EINVAL;
     }
 
-    pReqMsg = vos_mem_malloc(sizeof(*pReqMsg));
+    pReqMsg = vos_mem_malloc(sizeof(*pReqMsg) +
+                    (pHddCtx->no_of_probe_req_ouis) *
+                    (sizeof(struct vendor_oui)));
     if (!pReqMsg) {
         hddLog(LOGE, FL("vos_mem_malloc failed"));
         return -ENOMEM;
     }
+    vos_mem_zero(pReqMsg, sizeof(*pReqMsg) +
+                    (pHddCtx->no_of_probe_req_ouis) *
+                    (sizeof(struct vendor_oui)));
 
     /* Parse and fetch oui */
     if (!tb[QCA_WLAN_VENDOR_ATTR_SET_SCANNING_MAC_OUI]) {
@@ -1459,8 +1509,20 @@ __wlan_hdd_cfg80211_set_scanning_mac_oui(struct wiphy *wiphy,
             tb[QCA_WLAN_VENDOR_ATTR_SET_SCANNING_MAC_OUI],
             sizeof(pReqMsg->oui));
 
-    hddLog(LOG1, FL("Oui (%02x:%02x:%02x)"), pReqMsg->oui[0], pReqMsg->oui[1],
-                 pReqMsg->oui[2]);
+    /* populate pReqMsg for mac addr randomization */
+    pReqMsg->vdev_id = pAdapter->sessionId;
+    pReqMsg->enb_probe_req_sno_randomization = 1;
+
+    hddLog(LOG1, FL("Oui (%02x:%02x:%02x), vdev_id = %d"), pReqMsg->oui[0],
+                     pReqMsg->oui[1], pReqMsg->oui[2], pReqMsg->vdev_id);
+
+    if (pHddCtx->cfg_ini->probe_req_ie_whitelist)
+         wlan_hdd_fill_whitelist_ie_attrs(&pReqMsg->ie_whitelist,
+                                      pReqMsg->probe_req_ie_bitmap,
+                                      &pReqMsg->num_vendor_oui,
+                                      (struct vendor_oui *)((uint8_t *)pReqMsg +
+                                      sizeof(*pReqMsg)),
+                                      pHddCtx);
 
     status = sme_SetScanningMacOui(pHddCtx->hHal, pReqMsg);
     if (!HAL_STATUS_SUCCESS(status)) {
@@ -4413,6 +4475,11 @@ static int hdd_extscan_passpoint_fill_network_list(
 
 	expected_networks = req_msg->num_networks;
 	index = 0;
+
+	if (!tb[QCA_WLAN_VENDOR_ATTR_PNO_PASSPOINT_LIST_PARAM_NETWORK_ARRAY]) {
+		hddLog(LOGE, FL("attr network array failed"));
+		return -EINVAL;
+	}
 	nla_for_each_nested(networks,
 		tb[QCA_WLAN_VENDOR_ATTR_PNO_PASSPOINT_LIST_PARAM_NETWORK_ARRAY],
 		rem1) {
@@ -8193,6 +8260,20 @@ int wlan_hdd_cfg80211_update_band(struct wiphy *wiphy, eCsrBand eBand)
     }
     return 0;
 }
+
+#ifdef CFG80211_SCAN_RANDOM_MAC_ADDR
+static void wlan_hdd_cfg80211_scan_randomization_init(struct wiphy *wiphy)
+{
+	wiphy->features |= NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR;
+	wiphy->features |= NL80211_FEATURE_SCHED_SCAN_RANDOM_MAC_ADDR;
+}
+#else
+static void wlan_hdd_cfg80211_scan_randomization_init(struct wiphy *wiphy)
+{
+	return;
+}
+#endif
+
 /*
  * FUNCTION: wlan_hdd_cfg80211_init
  * This function is called by hdd_wlan_startup()
@@ -8415,6 +8496,7 @@ int wlan_hdd_cfg80211_init(struct device *dev,
     }
 #endif
 #endif
+    wlan_hdd_cfg80211_scan_randomization_init(wiphy);
 
     EXIT();
     return 0;
@@ -8978,7 +9060,7 @@ static void wlan_hdd_add_extra_ie(hdd_adapter_t* pHostapdAdapter,
         elem_id  = ptr[0];
         elem_len = ptr[1];
         left -= 2;
-        if (elem_len > left)
+        if (elem_len > left || elem_len < WPS_OUI_TYPE_SIZE)
         {
             hddLog( VOS_TRACE_LEVEL_ERROR,
                     "****Invalid IEs eid = %d elem_len=%d left=%d*****",
@@ -9217,13 +9299,21 @@ VOS_STATUS wlan_hdd_validate_operation_channel(hdd_adapter_t *pAdapter,int chann
 }
 
 /**
- * FUNCTION: wlan_hdd_cfg80211_set_channel
+ * __wlan_hdd_cfg80211_set_channel() - cfg80211 set channel
+ * @wiphy: pointer to wiphy structure
+ * @dev: pointer to net_device structure
+ * @chan: pointer to ieee80211_channel structure
+ * @channel_type: channel type
+ *
  * This function is used to set the channel number
+ *
+ * Return; 0 on success, error number otherwise
  */
-static int wlan_hdd_cfg80211_set_channel( struct wiphy *wiphy, struct net_device *dev,
-                                   struct ieee80211_channel *chan,
-                                   enum nl80211_channel_type channel_type
-                                 )
+static int
+__wlan_hdd_cfg80211_set_channel(struct wiphy *wiphy,
+				struct net_device *dev,
+				struct ieee80211_channel *chan,
+				enum nl80211_channel_type channel_type)
 {
     hdd_adapter_t *pAdapter = NULL;
     v_U32_t num_ch = 0;
@@ -9411,6 +9501,33 @@ static int wlan_hdd_cfg80211_set_channel( struct wiphy *wiphy, struct net_device
     }
     EXIT();
     return status;
+}
+
+/**
+ * wlan_hdd_cfg80211_set_channel() - cfg80211 set channel
+ * @wiphy: pointer to wiphy structure
+ * @dev: pointer to net_device structure
+ * @chan: pointer to ieee80211_channel structure
+ * @channel_type: channel type
+ *
+ * This is the cfg80211 set channel handler function which invokes
+ * the internal function @__wlan_hdd_cfg80211_set_channel with
+ * SSR protection.
+ *
+ * Return; 0 on success, error number otherwise
+ */
+static int wlan_hdd_cfg80211_set_channel(struct wiphy *wiphy,
+					struct net_device *dev,
+					struct ieee80211_channel *chan,
+					enum nl80211_channel_type channel_type)
+{
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_cfg80211_set_channel(wiphy, dev, chan, channel_type);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
 }
 
 /*
@@ -11003,6 +11120,7 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
            goto done;
 
         case NL80211_IFTYPE_ADHOC:
+           wlan_hdd_tdls_exit(pAdapter);
            hddLog(LOG1, FL("Setting interface Type to ADHOC"));
            wlan_hdd_change_iface_to_adhoc(ndev, pRoamProfile, type);
            break;
@@ -11312,6 +11430,15 @@ static int wlan_hdd_tdls_add_station(struct wiphy *wiphy,
         return -ENOTSUPP;
     }
 
+    if (!test_bit(TDLS_INIT_DONE, &pAdapter->event_flags)) {
+        hddLog(LOG1, FL("TDLS init was not done!"));
+        if (0 != wlan_hdd_tdls_init(pAdapter)) {
+            hddLog(LOGE, FL("wlan_hdd_tdls_init failed, exit"));
+            return -EINVAL;
+        }
+        set_bit(TDLS_INIT_DONE, &pAdapter->event_flags);
+    }
+
     pTdlsPeer = wlan_hdd_tdls_get_peer(pAdapter, mac);
 
     if ( NULL == pTdlsPeer ) {
@@ -11439,16 +11566,20 @@ static int wlan_hdd_tdls_add_station(struct wiphy *wiphy,
                                        pAdapter->sessionId, mac, StaParams);
     }
 
-     rc = wait_for_completion_timeout(&pAdapter->tdls_add_station_comp,
+    rc = wait_for_completion_timeout(&pAdapter->tdls_add_station_comp,
            msecs_to_jiffies(WAIT_TIME_TDLS_ADD_STA));
+    mutex_lock(&pHddCtx->tdls_lock);
+    pTdlsPeer = wlan_hdd_tdls_find_peer(pAdapter, mac, FALSE);
 
-    if (!rc) {
-        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-                  "%s: timeout waiting for tdls add station indication",
-                  __func__);
-        return -EPERM;
+    if (rc <= 0 || (pTdlsPeer &&
+                   (pTdlsPeer->link_status == eTDLS_LINK_TEARING))) {
+        hddLog(LOGE, FL("timeout waiting for tdls add station indication %ld  peer link status %u"),
+                     ret, pTdlsPeer->link_status);
+        mutex_unlock(&pHddCtx->tdls_lock);
+        goto error;
     }
 
+    mutex_unlock(&pHddCtx->tdls_lock);
     if ( eHAL_STATUS_SUCCESS != pAdapter->tdlsAddStaStatus)
     {
         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
@@ -11480,7 +11611,16 @@ static bool wlan_hdd_is_duplicate_channel(tANI_U8 *arr,
     return FALSE;
 }
 
-static int wlan_hdd_change_station(struct wiphy *wiphy,
+/**
+ * __wlan_hdd_change_station() - change station
+ * @wiphy: Pointer to the wiphy structure
+ * @dev: Pointer to the net device.
+ * @mac: bssid
+ * @params: Pointer to station parameters
+ *
+ * Return: 0 for success, error number on failure.
+ */
+static int __wlan_hdd_change_station(struct wiphy *wiphy,
                                          struct net_device *dev,
                                          u8 *mac,
                                          struct station_parameters *params)
@@ -11494,6 +11634,7 @@ static int wlan_hdd_change_station(struct wiphy *wiphy,
     tCsrStaParams StaParams = {0};
     tANI_U8 isBufSta = 0;
     tANI_U8 isOffChannelSupported = 0;
+    bool is_qos_wmm_sta = false;
 #endif
     int ret;
 
@@ -11680,9 +11821,19 @@ static int wlan_hdd_change_station(struct wiphy *wiphy,
                 }
             }
 
+            if (pHddCtx->cfg_ini->fEnableTDLSWmmMode &&
+                (params->ht_capa || params->vht_capa ||
+                (params->sta_flags_set & BIT(NL80211_STA_FLAG_WME))))
+                is_qos_wmm_sta = true;
+
+            hddLog(VOS_TRACE_LEVEL_INFO,
+                   FL("%s: TDLS Peer is QOS capable is_qos_wmm_sta= %d HTcapPresent = %d"),
+                   __func__, is_qos_wmm_sta, StaParams.htcap_present);
+
             status = wlan_hdd_tdls_set_peer_caps(pAdapter, mac,
                                                   &StaParams, isBufSta,
-                                                  isOffChannelSupported);
+                                                  isOffChannelSupported,
+                                                  is_qos_wmm_sta);
             if (VOS_STATUS_SUCCESS != status) {
                 hddLog(VOS_TRACE_LEVEL_ERROR,
                        FL("wlan_hdd_tdls_set_peer_caps failed!"));
@@ -11700,6 +11851,40 @@ static int wlan_hdd_change_station(struct wiphy *wiphy,
     }
     EXIT();
     return ret;
+}
+
+/**
+ * wlan_hdd_change_station() - cfg80211 change station handler function
+ * @wiphy: Pointer to the wiphy structure
+ * @dev: Pointer to the net device.
+ * @mac: bssid
+ * @params: Pointer to station parameters
+ *
+ * This is the cfg80211 change station handler function which invokes
+ * the internal function @__wlan_hdd_change_station with
+ * SSR protection.
+ *
+ * Return: 0 for success, error number on failure.
+ */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)) || defined(WITH_BACKPORTS)
+static int wlan_hdd_change_station(struct wiphy *wiphy,
+				   struct net_device *dev,
+				   const u8 *mac,
+				   struct station_parameters *params)
+#else
+static int wlan_hdd_change_station(struct wiphy *wiphy,
+				   struct net_device *dev,
+				   u8 *mac,
+				   struct station_parameters *params)
+#endif
+{
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_change_station(wiphy, dev, mac, params);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
 }
 
 /*
@@ -12150,16 +12335,22 @@ static int wlan_hdd_cfg80211_get_key(
     return ret;
 }
 
-/*
- * FUNCTION: wlan_hdd_cfg80211_del_key
+/**
+ * __wlan_hdd_cfg80211_del_key() - cfg80211 delete key
+ * @wiphy: Pointer to wiphy structure.
+ * @ndev: Pointer to net_device structure.
+ * @key_index: key index
+ * @pairwise: pairwise
+ * @mac_addr: mac address
+ *
  * This function is used to delete the key information
+ *
+ * Return: 0 for success, error number on failure.
  */
-static int wlan_hdd_cfg80211_del_key( struct wiphy *wiphy,
-                                      struct net_device *ndev,
-                                      u8 key_index,
-                                      bool pairwise,
-                                      const u8 *mac_addr
-                                    )
+static int __wlan_hdd_cfg80211_del_key(struct wiphy *wiphy,
+					struct net_device *ndev,
+					u8 key_index,
+					bool pairwise, const u8 *mac_addr)
 {
     int status = 0;
 
@@ -12254,6 +12445,35 @@ static int wlan_hdd_cfg80211_del_key( struct wiphy *wiphy,
 #endif
     EXIT();
     return status;
+}
+
+/**
+ * wlan_hdd_cfg80211_del_key() - cfg80211 delete key handler function
+ * @wiphy: Pointer to wiphy structure.
+ * @dev: Pointer to net_device structure.
+ * @key_index: key index
+ * @pairwise: pairwise
+ * @mac_addr: mac address
+ *
+ * This is the cfg80211 delete key handler function which invokes
+ * the internal function @__wlan_hdd_cfg80211_del_key with
+ * SSR protection.
+ *
+ * Return: 0 for success, error number on failure.
+ */
+static int wlan_hdd_cfg80211_del_key(struct wiphy *wiphy,
+					struct net_device *dev,
+					u8 key_index,
+					bool pairwise, const u8 *mac_addr)
+{
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_cfg80211_del_key(wiphy, dev, key_index,
+					  pairwise, mac_addr);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
 }
 
 #ifdef NL80211_KEY_LEN_PMK /* kernel supports key mgmt offload */
@@ -12431,8 +12651,6 @@ struct cfg80211_bss* wlan_hdd_cfg80211_update_bss_list(
     struct ieee80211_channel *chan;
     struct cfg80211_bss *bss = NULL;
 
-    ENTER();
-
     if (NULL == pBssDesc) {
         hddLog(LOGE, FL("pBssDesc is NULL"));
         return bss;
@@ -12506,7 +12724,8 @@ wlan_hdd_cfg80211_inform_bss_frame( hdd_adapter_t *pAdapter,
     struct ieee80211_channel *chan;
     struct ieee80211_mgmt *mgmt = NULL;
     struct cfg80211_bss *bss_status = NULL;
-    size_t frame_len = sizeof (struct ieee80211_mgmt) + ie_length;
+    size_t frame_len = ie_length + offsetof(struct ieee80211_mgmt,
+                                               u.probe_resp.variable);
     int rssi = 0;
     hdd_context_t *pHddCtx;
     int status;
@@ -12623,7 +12842,8 @@ wlan_hdd_cfg80211_inform_bss_frame( hdd_adapter_t *pAdapter,
     rssi = (VOS_MIN(rssi, 0)) * 100;
 
     hddLog(LOG1, FL("BSSID: "MAC_ADDRESS_STR" Channel:%d RSSI:%d"),
-           MAC_ADDR_ARRAY(mgmt->bssid), chan->center_freq, (int)(rssi/100));
+           MAC_ADDR_ARRAY(mgmt->bssid),
+           vos_freq_to_chan(chan->center_freq),(int)(rssi/100));
 
     bss_status = cfg80211_inform_bss_frame(wiphy, chan, mgmt, frame_len, rssi,
                                            GFP_KERNEL);
@@ -12700,7 +12920,7 @@ static int wlan_hdd_cfg80211_update_bss( struct wiphy *wiphy,
     /* no scan results */
     if (NULL == pResult) {
         hddLog(LOG1, FL("No scan result Status %d"), status);
-        return status;
+        return -EAGAIN;
     }
 
     pScanResult = sme_ScanResultGetFirst(hHal, pResult);
@@ -13082,7 +13302,7 @@ bool hdd_isConnectionInProgress(hdd_context_t *pHddCtx)
 				return true;
 			}
 			if ((WLAN_HDD_INFRA_STATION == pAdapter->device_mode) &&
-				smeNeighborRoamIsHandoffInProgress(
+				smeNeighborMiddleOfRoaming(
 				WLAN_HDD_GET_HAL_CTX(pAdapter), pAdapter->sessionId))
 			{
 				hddLog(VOS_TRACE_LEVEL_ERROR,
@@ -13161,6 +13381,89 @@ static void wlan_hdd_cfg80211_scan_block_cb(struct work_struct *work)
         adapter->request = NULL;
     }
 }
+
+#ifdef CFG80211_SCAN_RANDOM_MAC_ADDR
+/**
+ * wlan_hdd_update_scan_rand_attrs - fill the host/pno scan rand attrs
+ * @scan_req: pointer for destination mac addr and mac mask
+ * @cfg_scan_req: pointer for source mac addr and mac mask
+ * @scan_type: type of scan from enum wlan_hdd_scan_type_for_randomization
+ *
+ * If scan randomize flag is set in cfg scan request flags, this function
+ * copies mac addr and mac mask in cfg80211 scan/sched scan request to
+ * randomization attributes in tCsrScanRequest (normal scan) or
+ * tpSirPNOScanReq (sched scan). Based on the type of scan, scan_req and
+ * cfg_scan_req are type casted accordingly.
+ *
+ * Return:   Return none
+ */
+static void wlan_hdd_update_scan_rand_attrs(void *scan_req,
+					    void *cfg_scan_req,
+					    uint32_t scan_type)
+{
+	uint32_t flags = 0;
+	uint8_t *cfg_mac_addr = NULL;
+	uint8_t *cfg_mac_addr_mask = NULL;
+	uint32_t *scan_randomization = NULL;
+	uint8_t *scan_mac_addr = NULL;
+	uint8_t *scan_mac_addr_mask = NULL;
+
+	if (scan_type == WLAN_HDD_HOST_SCAN) {
+		tCsrScanRequest *csr_scan_req = NULL;
+		struct cfg80211_scan_request *request = NULL;
+
+		csr_scan_req = (tCsrScanRequest *)scan_req;
+		request = (struct cfg80211_scan_request *)cfg_scan_req;
+
+		flags = request->flags;
+		if (!(flags & NL80211_SCAN_FLAG_RANDOM_ADDR))
+			return;
+
+		cfg_mac_addr = request->mac_addr;
+		cfg_mac_addr_mask = request->mac_addr_mask;
+		scan_randomization = &csr_scan_req->enable_scan_randomization;
+		scan_mac_addr = csr_scan_req->mac_addr;
+		scan_mac_addr_mask = csr_scan_req->mac_addr_mask;
+	} else if (scan_type == WLAN_HDD_PNO_SCAN) {
+		tpSirPNOScanReq pno_scan_req = NULL;
+		struct cfg80211_sched_scan_request *request = NULL;
+
+		pno_scan_req = (tpSirPNOScanReq)scan_req;
+		request = (struct cfg80211_sched_scan_request *)cfg_scan_req;
+
+		flags = request->flags;
+		if (!(flags & NL80211_SCAN_FLAG_RANDOM_ADDR))
+			return;
+
+		cfg_mac_addr = request->mac_addr;
+		cfg_mac_addr_mask = request->mac_addr_mask;
+		scan_randomization =
+				&pno_scan_req->enable_pno_scan_randomization;
+		scan_mac_addr = pno_scan_req->mac_addr;
+		scan_mac_addr_mask = pno_scan_req->mac_addr_mask;
+	} else {
+		hddLog(LOGE, FL("invalid scan type for randomization"));
+		return;
+	}
+
+	/* enable mac randomization */
+	*scan_randomization = 1;
+	memcpy(scan_mac_addr, cfg_mac_addr, VOS_MAC_ADDR_SIZE);
+	memcpy(scan_mac_addr_mask, cfg_mac_addr_mask, VOS_MAC_ADDR_SIZE);
+
+	hddLog(LOG1, FL("Mac Addr: "MAC_ADDRESS_STR
+			" and Mac Mask: " MAC_ADDRESS_STR),
+			MAC_ADDR_ARRAY(scan_mac_addr),
+			MAC_ADDR_ARRAY(scan_mac_addr_mask));
+}
+#else
+static void wlan_hdd_update_scan_rand_attrs(void *scan_req,
+					    void *cfg_scan_req,
+					    uint32_t scan_type)
+{
+	return;
+}
+#endif
 
 /*
  * FUNCTION: __wlan_hdd_cfg80211_scan
@@ -13534,6 +13837,28 @@ int __wlan_hdd_cfg80211_scan( struct wiphy *wiphy,
            scanRequest.minChnTime, scanRequest.maxChnTime,
            scanRequest.p2pSearch, scanRequest.skipDfsChnlInP2pSearch);
 
+    wlan_hdd_update_scan_rand_attrs((void *)&scanRequest, (void *)request,
+                                    WLAN_HDD_HOST_SCAN);
+
+    if (pHddCtx->no_of_probe_req_ouis != 0) {
+        scanRequest.voui = (struct vendor_oui *)vos_mem_malloc(
+                                              pHddCtx->no_of_probe_req_ouis *
+                                              sizeof(struct vendor_oui));
+        if (!scanRequest.voui) {
+            hddLog(LOGE, FL("Not enough memory for voui"));
+            scanRequest.num_vendor_oui = 0;
+            status = -ENOMEM;
+            goto free_mem;
+        }
+    }
+
+    if (pHddCtx->cfg_ini->probe_req_ie_whitelist)
+        wlan_hdd_fill_whitelist_ie_attrs(&scanRequest.ie_whitelist,
+                                         scanRequest.probe_req_ie_bitmap,
+                                         &scanRequest.num_vendor_oui,
+                                         scanRequest.voui,
+                                         pHddCtx);
+
     status = sme_ScanRequest( WLAN_HDD_GET_HAL_CTX(pAdapter),
                               pAdapter->sessionId, &scanRequest, &scanId,
                               &hdd_cfg80211_scan_done_callback, dev );
@@ -13572,6 +13897,9 @@ free_mem:
 
     if( channelList )
       vos_mem_free( channelList );
+
+    if(scanRequest.voui)
+        vos_mem_free(scanRequest.voui);
 
     EXIT();
 
@@ -14606,6 +14934,13 @@ static int __wlan_hdd_cfg80211_connect( struct wiphy *wiphy,
                                       )
 {
     int status;
+    u16 channel;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0)) || \
+    defined(CFG80211_BSSID_HINT_BACKPORT)
+    const u8 *bssid_hint = req->bssid_hint;
+#else
+    const u8 *bssid_hint = NULL;
+#endif
     hdd_adapter_t *pAdapter = WLAN_HDD_GET_PRIV_PTR( ndev );
     VOS_STATUS exitbmpsStatus = VOS_STATUS_E_INVAL;
     hdd_context_t *pHddCtx;
@@ -14717,27 +15052,20 @@ static int __wlan_hdd_cfg80211_connect( struct wiphy *wiphy,
         return status;
     }
 
-    if (req->channel) {
-        status = wlan_hdd_cfg80211_connect_start(pAdapter, req->ssid,
-                                                  req->ssid_len, req->bssid,
-                          #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,15,0)) || \
-                                           defined(CFG80211_BSSID_HINT_BACKPORT)
-                                                  req->bssid_hint,
-                          #else
-                                                  NULL,
-                          #endif
-                                                  req->channel->hw_value);
-    } else {
-        status = wlan_hdd_cfg80211_connect_start(pAdapter, req->ssid,
-                                                  req->ssid_len, req->bssid,
-                          #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,15,0)) || \
-                                           defined(CFG80211_BSSID_HINT_BACKPORT)
-                                                  req->bssid_hint,
-                          #else
-                                                  NULL,
-                          #endif
-                                                  0);
-    }
+    if (req->channel)
+        channel = req->channel->hw_value;
+    else
+        channel = 0;
+
+    /* Abort if any scan is going on */
+    status = wlan_hdd_scan_abort(pAdapter);
+    if (0 != status)
+        hddLog(VOS_TRACE_LEVEL_ERROR, FL("scan abort failed"));
+
+    status = wlan_hdd_cfg80211_connect_start(pAdapter, req->ssid,
+                                             req->ssid_len, req->bssid,
+                                             bssid_hint, channel);
+
     if (0 != status) {
         //ReEnable BMPS if disabled
         // If PS offload is enabled, fw will take care of
@@ -14873,9 +15201,6 @@ static int __wlan_hdd_cfg80211_disconnect( struct wiphy *wiphy,
     int status;
     hdd_station_ctx_t *pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
     hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
-#ifdef FEATURE_WLAN_TDLS
-    tANI_U8 staIdx;
-#endif
 
     ENTER();
 
@@ -14941,22 +15266,10 @@ static int __wlan_hdd_cfg80211_disconnect( struct wiphy *wiphy,
 
         wlan_hdd_cleanup_remain_on_channel_ctx(pAdapter);
 #ifdef FEATURE_WLAN_TDLS
-        /* First clean up the tdls peers if any */
-        for (staIdx = 0 ; staIdx < pHddCtx->max_num_tdls_sta; staIdx++) {
-            if ((pHddCtx->tdlsConnInfo[staIdx].sessionId == pAdapter->sessionId) &&
-                (pHddCtx->tdlsConnInfo[staIdx].staId)) {
-                uint8 *mac;
-                mac = pHddCtx->tdlsConnInfo[staIdx].peerMac.bytes;
-                hddLog(TDLS_LOG_LEVEL,
-                       "%s: call sme_DeleteTdlsPeerSta staId %d sessionId %d " MAC_ADDRESS_STR,
-                       __func__, pHddCtx->tdlsConnInfo[staIdx].staId,
-                        pAdapter->sessionId,
-                        MAC_ADDR_ARRAY(mac));
-                sme_DeleteTdlsPeerSta(WLAN_HDD_GET_HAL_CTX(pAdapter),
-                                      pAdapter->sessionId,
-                                      mac);
-            }
-        }
+        /* Delete all connected TDLS peers by sending deauth */
+        hddLog(LOG1, FL("Delete all connected TDLS peers"));
+        sme_delete_all_tdls_peers(WLAN_HDD_GET_HAL_CTX(pAdapter),
+                        pAdapter->sessionId);
 #endif
         hddLog(LOG1, FL("Disconnecting with reasoncode:%u"), reasonCode);
         status = wlan_hdd_disconnect(pAdapter, reasonCode);
@@ -15571,12 +15884,18 @@ static int wlan_hdd_cfg80211_set_txpower(struct wiphy *wiphy,
    return ret;
 }
 
-/*
- * FUNCTION: wlan_hdd_cfg80211_get_txpower
+/**
+ * __wlan_hdd_cfg80211_get_txpower() - cfg80211 get txpower
+ * @wiphy: Pointer to wiphy structure.
+ * @wdev: Pointer to wireless_dev structure.
+ * @dbm: dbm
+ *
  * This function is used to read the txpower
+ *
+ * Return: 0 for success, error number on failure.
  */
-static int wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,8,0)
+static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0) || defined(WITH_BACKPORTS)
                                          struct wireless_dev *wdev,
 #endif
                                          int *dbm)
@@ -15606,6 +15925,37 @@ static int wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
 
     EXIT();
     return 0;
+}
+
+/**
+ * wlan_hdd_cfg80211_get_txpower() - cfg80211 get power handler function
+ * @wiphy: Pointer to wiphy structure.
+ * @wdev: Pointer to wireless_dev structure.
+ * @dbm: dbm
+ *
+ * This is the cfg80211 get txpower handler function which invokes
+ * the internal function @__wlan_hdd_cfg80211_get_txpower with
+ * SSR protection.
+ *
+ * Return: 0 for success, error number on failure.
+ */
+static int wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0) || defined(WITH_BACKPORTS)
+					 struct wireless_dev *wdev,
+#endif
+					 int *dbm)
+{
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_cfg80211_get_txpower(wiphy,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0) || defined(WITH_BACKPORTS)
+						wdev,
+#endif
+						dbm);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
 }
 
 
@@ -16198,8 +16548,15 @@ static int wlan_hdd_cfg80211_set_power_mgmt(struct wiphy *wiphy,
     return ret;
 }
 
-
-static int wlan_hdd_set_default_mgmt_key(struct wiphy *wiphy,
+/**
+ * __wlan_hdd_set_default_mgmt_key() - set default mgmt key
+ * @wiphy: pointer to wiphy
+ * @netdev: pointer to net_device structure
+ * @key_index: key index
+ *
+ * Return: 0 on success
+ */
+static int __wlan_hdd_set_default_mgmt_key(struct wiphy *wiphy,
                          struct net_device *netdev,
                          u8 key_index)
 {
@@ -16207,20 +16564,85 @@ static int wlan_hdd_set_default_mgmt_key(struct wiphy *wiphy,
     return 0;
 }
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,4,0))
-static int wlan_hdd_set_txq_params(struct wiphy *wiphy,
-                   struct net_device *dev,
-                   struct ieee80211_txq_params *params)
+/**
+ * wlan_hdd_set_default_mgmt_key() - SSR wrapper for
+ *				wlan_hdd_set_default_mgmt_key
+ * @wiphy: pointer to wiphy
+ * @netdev: pointer to net_device structure
+ * @key_index: key index
+ *
+ * Return: 0 on success, error number on failure
+ */
+static int wlan_hdd_set_default_mgmt_key(struct wiphy *wiphy,
+					   struct net_device *netdev,
+					   u8 key_index)
 {
-    ENTER();
-    return 0;
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_set_default_mgmt_key(wiphy, netdev, key_index);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
+}
+
+/**
+ * __wlan_hdd_set_txq_params() - set tx queue parameters
+ * @wiphy: pointer to wiphy
+ * @netdev: pointer to net_device structure
+ * @params: pointer to ieee80211_txq_params
+ *
+ * Return: 0 on success
+ */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 4, 0)) || defined(WITH_BACKPORTS)
+static int __wlan_hdd_set_txq_params(struct wiphy *wiphy,
+				     struct net_device *dev,
+				     struct ieee80211_txq_params *params)
+{
+	ENTER();
+	return 0;
+}
+#else
+static int __wlan_hdd_set_txq_params(struct wiphy *wiphy,
+				     struct ieee80211_txq_params *params)
+{
+	ENTER();
+	return 0;
+}
+#endif
+
+/**
+ * wlan_hdd_set_txq_params() - SSR wrapper for wlan_hdd_set_txq_params
+ * @wiphy: pointer to wiphy
+ * @netdev: pointer to net_device structure
+ * @params: pointer to ieee80211_txq_params
+ *
+ * Return: 0 on success, error number on failure
+ */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 4, 0)) || defined(WITH_BACKPORTS)
+static int wlan_hdd_set_txq_params(struct wiphy *wiphy,
+				   struct net_device *dev,
+				   struct ieee80211_txq_params *params)
+{
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_set_txq_params(wiphy, dev, params);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
 }
 #else
 static int wlan_hdd_set_txq_params(struct wiphy *wiphy,
-                   struct ieee80211_txq_params *params)
+				   struct ieee80211_txq_params *params)
 {
-    ENTER();
-    return 0;
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_set_txq_params(wiphy, params);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
 }
 #endif //LINUX_VERSION_CODE
 
@@ -16341,7 +16763,8 @@ int wlan_hdd_cfg80211_del_station(struct wiphy *wiphy,
     vos_ssr_protect(__func__);
 #ifdef CFG80211_DEL_STA_V2
     if (NULL == param) {
-        hddLog(VOS_TRACE_LEVEL_ERROR, "%s: Invalid argumet passed", __func__);
+        hddLog(LOGE, FL("Invalid argument passed"));
+        vos_ssr_unprotect(__func__);
         return -EINVAL;
     }
 
@@ -16688,9 +17111,18 @@ void hdd_cfg80211_sched_scan_done_callback(void *callbackContext,
 
     ret = wlan_hdd_cfg80211_update_bss(pHddCtx->wiphy, pAdapter);
 
-    if (0 > ret)
+    if (0 > ret) {
         hddLog(VOS_TRACE_LEVEL_INFO, "%s: NO SCAN result", __func__);
 
+    } else {
+        /*
+         * Acquire wakelock to handle the case where APP's tries to suspend
+         * immediately after the driver gets connect request(i.e after pno)
+         * from supplicant, this result in app's is suspending and not able
+         * to process the connect request to AP
+         */
+        hdd_prevent_suspend_timeout(1000, WIFI_POWER_EVENT_WAKELOCK_SCAN);
+    }
     cfg80211_sched_scan_results(pHddCtx->wiphy);
     VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
             "%s: cfg80211 scan result database updated", __func__);
@@ -16793,7 +17225,9 @@ static int __wlan_hdd_cfg80211_sched_scan_start(struct wiphy *wiphy,
         return -ENOTSUPP;
     }
 
-    pPnoRequest = (tpSirPNOScanReq) vos_mem_malloc(sizeof (tSirPNOScanReq));
+    pPnoRequest = (tpSirPNOScanReq) vos_mem_malloc(sizeof(tSirPNOScanReq) +
+                                    (pHddCtx->no_of_probe_req_ouis) *
+                                    (sizeof(struct vendor_oui)));
     if (NULL == pPnoRequest)
     {
         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_FATAL,
@@ -16801,7 +17235,9 @@ static int __wlan_hdd_cfg80211_sched_scan_start(struct wiphy *wiphy,
         return -ENOMEM;
     }
 
-    memset(pPnoRequest, 0, sizeof (tSirPNOScanReq));
+    memset(pPnoRequest, 0, sizeof (tSirPNOScanReq) +
+                           (pHddCtx->no_of_probe_req_ouis) *
+                           (sizeof(struct vendor_oui)));
     pPnoRequest->enable = 1; /*Enable PNO */
     pPnoRequest->ucNetworksCount = request->n_match_sets;
 
@@ -16942,6 +17378,18 @@ static int __wlan_hdd_cfg80211_sched_scan_start(struct wiphy *wiphy,
     VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
              "SessionId %d, enable %d, modePNO %d",
              pAdapter->sessionId, pPnoRequest->enable, pPnoRequest->modePNO);
+
+    wlan_hdd_update_scan_rand_attrs((void *)pPnoRequest, (void *)request,
+                                    WLAN_HDD_PNO_SCAN);
+
+    if (pHddCtx->cfg_ini->probe_req_ie_whitelist)
+        wlan_hdd_fill_whitelist_ie_attrs(&pPnoRequest->ie_whitelist,
+                                         pPnoRequest->probe_req_ie_bitmap,
+                                         &pPnoRequest->num_vendor_oui,
+                                         (struct vendor_oui *)(
+                                         (uint8_t *)pPnoRequest +
+                                         sizeof(*pPnoRequest)),
+                                         pHddCtx);
 
     status = sme_SetPreferredNetworkList(WLAN_HDD_GET_HAL_CTX(pAdapter),
                               pPnoRequest, pAdapter->sessionId,
@@ -17086,14 +17534,35 @@ static int wlan_hdd_cfg80211_sched_scan_stop(struct wiphy *wiphy,
 
 
 #ifdef FEATURE_WLAN_TDLS
+
+/**
+ * __wlan_hdd_cfg80211_tdls_mgmt() - cfg80211 tdls mgmt handler function
+ * @wiphy: Pointer to wiphy structure.
+ * @dev: Pointer to net_device structure.
+ * @peer: peer address
+ * @action_code: action code
+ * @dialog_token: dialog token
+ * @status_code: status code
+ * @peer_capability: peer capability
+ * @buf: buffer
+ * @len: Length of @buf
+ *
+ * Return: 0 for success, error number on failure.
+ */
 #if TDLS_MGMT_VERSION2
-static int wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy, struct net_device *dev,
-                     u8 *peer, u8 action_code,  u8 dialog_token,
-                      u16 status_code, u32 peer_capability, const u8 *buf, size_t len)
+static int __wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy,
+                                       struct net_device *dev,
+                                       u8 *peer, u8 action_code,
+                                       u8 dialog_token,
+                                       u16 status_code, u32 peer_capability,
+                                       const u8 *buf, size_t len)
 #else
-static int wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy, struct net_device *dev,
-                     u8 *peer, u8 action_code,  u8 dialog_token,
-                     u16 status_code, const u8 *buf, size_t len)
+static int __wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy,
+                                       struct net_device *dev,
+                                       u8 *peer, u8 action_code,
+                                       u8 dialog_token,
+                                       u16 status_code,
+                                       const u8 *buf, size_t len)
 #endif
 {
 
@@ -17163,6 +17632,16 @@ static int wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy, struct net_device *d
                        __func__, MAC_ADDR_ARRAY(peer), action_code);
             return -EPERM;
         }
+    }
+    /* Discard TDLS Discovery request and setup confirm if violates ACM rules */
+    if ((SIR_MAC_TDLS_DIS_REQ == action_code || SIR_MAC_TDLS_SETUP_CNF == action_code) &&
+        (hdd_wmm_is_active(pAdapter)) &&
+        !(pAdapter->hddWmmStatus.wmmAcStatus[WLANTL_AC_VI].wmmAcAccessAllowed))
+    {
+        VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                  "%s: Admission control is set to VI, action %d is not allowed.",
+                  __func__, action_code);
+        return -EPERM;
     }
 
     if (SIR_MAC_TDLS_SETUP_REQ == action_code ||
@@ -17244,6 +17723,7 @@ static int wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy, struct net_device *d
     /* For explicit trigger of DIS_REQ come out of BMPS for
        successfully receiving DIS_RSP from peer. */
     if ((SIR_MAC_TDLS_SETUP_RSP == action_code) ||
+        (SIR_MAC_TDLS_SETUP_CNF == action_code) ||
         (SIR_MAC_TDLS_DIS_RSP == action_code) ||
         (SIR_MAC_TDLS_DIS_REQ == action_code))
     {
@@ -17334,6 +17814,56 @@ static int wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy, struct net_device *d
     return 0;
 }
 
+/**
+ * wlan_hdd_cfg80211_tdls_mgmt() - cfg80211 tdls mgmt handler function
+ * @wiphy: Pointer to wiphy structure.
+ * @dev: Pointer to net_device structure.
+ * @peer: peer address
+ * @action_code: action code
+ * @dialog_token: dialog token
+ * @status_code: status code
+ * @peer_capability: peer capability
+ * @buf: buffer
+ * @len: Length of @buf
+ *
+ * This is the cfg80211 tdls mgmt handler function which invokes
+ * the internal function @__wlan_hdd_cfg80211_tdls_mgmt with
+ * SSR protection.
+ *
+ * Return: 0 for success, error number on failure.
+ */
+#if TDLS_MGMT_VERSION2
+static int wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy,
+					struct net_device *dev,
+					u8 *peer, u8 action_code,
+					u8 dialog_token,
+					u16 status_code, u32 peer_capability,
+					const u8 *buf, size_t len)
+#else
+static int wlan_hdd_cfg80211_tdls_mgmt(struct wiphy *wiphy,
+					struct net_device *dev,
+					u8 *peer, u8 action_code,
+					u8 dialog_token,
+					u16 status_code, const u8 *buf,
+					size_t len)
+#endif
+{
+	int ret;
+
+	vos_ssr_protect(__func__);
+#if TDLS_MGMT_VERSION2
+	ret = __wlan_hdd_cfg80211_tdls_mgmt(wiphy, dev, peer, action_code,
+						dialog_token, status_code,
+						peer_capability, buf, len);
+#else
+	ret = __wlan_hdd_cfg80211_tdls_mgmt(wiphy, dev, peer, action_code,
+					dialog_token, status_code, buf, len);
+#endif
+
+	vos_ssr_unprotect(__func__);
+
+	return ret;
+}
 
 int wlan_hdd_tdls_extctrl_config_peer(hdd_adapter_t *pAdapter,
                                       u8 *peer,
@@ -17518,6 +18048,9 @@ static int __wlan_hdd_cfg80211_tdls_oper(struct wiphy *wiphy,
                                 __func__, pTdlsPeer->staId, MAC_ADDR_ARRAY(peer));
                     return -EINVAL;
                 }
+                wlan_hdd_tdls_set_cap(pAdapter, peer, eTDLS_CAP_SUPPORTED);
+                vos_mem_set(&tdlsLinkEstablishParams,
+                            sizeof(tCsrTdlsLinkEstablishParams), 0);
 
                 if (eTDLS_LINK_CONNECTED != pTdlsPeer->link_status)
                 {
@@ -17538,7 +18071,19 @@ static int __wlan_hdd_cfg80211_tdls_oper(struct wiphy *wiphy,
                         rc = wait_for_completion_timeout(
                                 &pAdapter->tdls_link_establish_req_comp,
                                 msecs_to_jiffies(WAIT_TIME_TDLS_LINK_ESTABLISH_REQ));
-                        if (!rc) {
+                        mutex_lock(&pHddCtx->tdls_lock);
+                        pTdlsPeer = wlan_hdd_tdls_find_peer(pAdapter,
+                                                            peer, FALSE);
+                        if (!pTdlsPeer) {
+                            mutex_unlock(&pHddCtx->tdls_lock);
+                            hddLog(LOGE, FL(MAC_ADDRESS_STR" (oper %d) peer got freed in other context. ignored"),
+                                         MAC_ADDR_ARRAY(peer), (int)oper);
+                            return -EINVAL;
+                        }
+                        mutex_unlock(&pHddCtx->tdls_lock);
+
+                        if ((rc <= 0) || (pTdlsPeer->link_status ==
+                                                eTDLS_LINK_TEARING)) {
                             VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
                               "%s: Link Establish Request timed out", __func__);
                             return -EINVAL;
@@ -17547,8 +18092,25 @@ static int __wlan_hdd_cfg80211_tdls_oper(struct wiphy *wiphy,
                     wlan_hdd_tdls_set_peer_link_status(pTdlsPeer,
                                                        eTDLS_LINK_CONNECTED,
                                                        eTDLS_LINK_SUCCESS);
+
+                    VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
+                              "%s : tdlsLinkEstablishParams of peer " MAC_ADDRESS_STR "uapsdQueues: %d"
+                              " qos: %d maxSp: %d isBufSta: %d isOffChannelSupported: %d"
+                              " isResponder: %d peerstaId: %d",
+                              __func__, MAC_ADDR_ARRAY(tdlsLinkEstablishParams.peerMac),
+                              tdlsLinkEstablishParams.uapsdQueues,
+                              tdlsLinkEstablishParams.qos,
+                              tdlsLinkEstablishParams.maxSp,
+                              tdlsLinkEstablishParams.isBufSta,
+                              tdlsLinkEstablishParams.isOffChannelSupported,
+                              tdlsLinkEstablishParams.isResponder,
+                              pTdlsPeer->staId);
+
                     /* start TDLS client registration with TL */
-                    status = hdd_roamRegisterTDLSSTA( pAdapter, peer, pTdlsPeer->staId, pTdlsPeer->signature);
+                    status = hdd_roamRegisterTDLSSTA(pAdapter, peer,
+                                                     pTdlsPeer->staId,
+                                                     pTdlsPeer->signature,
+                                                     pTdlsPeer->qos);
                     if (VOS_STATUS_SUCCESS == status)
                     {
                         tANI_U8 i;
@@ -17918,12 +18480,18 @@ int wlan_hdd_cfg80211_set_rekey_data(struct wiphy *wiphy,
     return ret;
 }
 #endif /*WLAN_FEATURE_GTK_OFFLOAD*/
-/*
- * FUNCTION: wlan_hdd_cfg80211_set_mac_acl
- * This function is used to set access control policy
+
+/**
+ * __wlan_hdd_cfg80211_set_mac_acl() - Set access control policy
+ * @wiphy: pointer to wiphy structure
+ * @dev: pointer to net_device
+ * @params: pointer to cfg80211_acl_data
+ *
+ * Return; 0 on success, error number otherwise
  */
-static int wlan_hdd_cfg80211_set_mac_acl(struct wiphy *wiphy,
-                struct net_device *dev, const struct cfg80211_acl_data *params)
+static int __wlan_hdd_cfg80211_set_mac_acl(struct wiphy *wiphy,
+					struct net_device *dev,
+					const struct cfg80211_acl_data *params)
 {
     int i;
     hdd_adapter_t *pAdapter =  WLAN_HDD_GET_PRIV_PTR(dev);
@@ -18047,6 +18615,29 @@ static int wlan_hdd_cfg80211_set_mac_acl(struct wiphy *wiphy,
     }
 
     return 0;
+}
+
+/**
+ * wlan_hdd_cfg80211_set_mac_acl() - SSR wrapper for
+ *				__wlan_hdd_cfg80211_set_mac_acl
+ * @wiphy: pointer to wiphy structure
+ * @dev: pointer to net_device
+ * @params: pointer to cfg80211_acl_data
+ *
+ * Return; 0 on success, error number otherwise
+ */
+static int
+wlan_hdd_cfg80211_set_mac_acl(struct wiphy *wiphy,
+			      struct net_device *dev,
+			      const struct cfg80211_acl_data *params)
+{
+	int ret;
+
+	vos_ssr_protect(__func__);
+	ret = __wlan_hdd_cfg80211_set_mac_acl(wiphy, dev, params);
+	vos_ssr_unprotect(__func__);
+
+	return ret;
 }
 
 #ifdef WLAN_NL80211_TESTMODE
@@ -18464,7 +19055,7 @@ int __wlan_hdd_cfg80211_resume_wlan(struct wiphy *wiphy)
                  * results in app's is in suspended state and not able to
                  * process the connect request to AP
                  */
-                hdd_prevent_suspend_timeout(2000,
+                hdd_prevent_suspend_timeout(1000,
                                          WIFI_POWER_EVENT_WAKELOCK_RESUME_WLAN);
                 cfg80211_sched_scan_results(pHddCtx->wiphy);
             }

@@ -81,8 +81,7 @@
 extern tSirRetStatus wlan_cfgGetStr(tpAniSirGlobal, tANI_U16, tANI_U8*, tANI_U32*);
 
 void csrScanGetResultTimerHandler(void *);
-void csrScanResultAgingTimerHandler(void *pv);
-static void csrScanResultCfgAgingTimerHandler(void *pv);
+static void csrPurgeScanResultByAge(void *pv);
 void csrScanIdleScanTimerHandler(void *);
 static void csrSetDefaultScanTiming( tpAniSirGlobal pMac, tSirScanType scanType, tCsrScanRequest *pScanRequest);
 #ifdef WLAN_AP_STA_CONCURRENCY
@@ -193,19 +192,6 @@ eHalStatus csrScanOpen( tpAniSirGlobal pMac )
             smsLog(pMac, LOGE, FL("cannot allocate memory for idleScan timer"));
             break;
         }
-        status = vos_timer_init(&pMac->scan.hTimerResultAging, VOS_TIMER_TYPE_SW, csrScanResultAgingTimerHandler, pMac);
-        if (!HAL_STATUS_SUCCESS(status))
-        {
-            smsLog(pMac, LOGE, FL("cannot allocate memory for ResultAging timer"));
-            break;
-        }
-        status = vos_timer_init(&pMac->scan.hTimerResultCfgAging, VOS_TIMER_TYPE_SW,
-                                csrScanResultCfgAgingTimerHandler, pMac);
-        if (!HAL_STATUS_SUCCESS(status))
-        {
-            smsLog(pMac, LOGE, FL("cannot allocate memory for CFG ResultAging timer"));
-            break;
-        }
     }while(0);
 
     return (status);
@@ -229,8 +215,6 @@ eHalStatus csrScanClose( tpAniSirGlobal pMac )
     csrLLClose(&pMac->scan.channelPowerInfoList24);
     csrLLClose(&pMac->scan.channelPowerInfoList5G);
     csrScanDisable(pMac);
-    vos_timer_destroy(&pMac->scan.hTimerResultAging);
-    vos_timer_destroy(&pMac->scan.hTimerResultCfgAging);
     vos_timer_destroy(&pMac->scan.hTimerGetResult);
 #ifdef WLAN_AP_STA_CONCURRENCY
     vos_timer_destroy(&pMac->scan.hTimerStaApConcTimer);
@@ -5401,7 +5385,7 @@ eHalStatus csrScanSmeScanResponse( tpAniSirGlobal pMac, void *pMsgBuf )
     tListElem *pEntry;
     tSmeCmd *pCommand;
     eCsrScanStatus scanStatus;
-    tSirSmeScanRsp *pScanRsp = (tSirSmeScanRsp *)pMsgBuf;
+    tSirSmeScanRsp *pScanRsp;
     tSmeGetScanChnRsp *pScanChnInfo;
     tANI_BOOLEAN fRemoveCommand = eANI_BOOLEAN_TRUE;
     eCsrScanReason reason = eCsrScanOther;
@@ -5417,7 +5401,9 @@ eHalStatus csrScanSmeScanResponse( tpAniSirGlobal pMac, void *pMsgBuf )
         pCommand = GET_BASE_ADDR( pEntry, tSmeCmd, Link );
         if ( eSmeCommandScan == pCommand->command )
         {
-            scanStatus = (eSIR_SME_SUCCESS == pScanRsp->statusCode) ? eCSR_SCAN_SUCCESS : eCSR_SCAN_FAILURE;
+            /* Purge the scan results based on Aging */
+            if (pEntry && pMac->scan.scanResultCfgAgingTime)
+                csrPurgeScanResultByAge(pMac);
             reason = pCommand->u.scanCmd.reason;
             switch(pCommand->u.scanCmd.reason)
             {
@@ -5425,25 +5411,36 @@ eHalStatus csrScanSmeScanResponse( tpAniSirGlobal pMac, void *pMsgBuf )
             case eCsrScanAbortNormalScan:
             case eCsrScanBGScanAbort:
             case eCsrScanBGScanEnable:
+                pScanRsp = (tSirSmeScanRsp *)pMsgBuf;
+                scanStatus = (eSIR_SME_SUCCESS == pScanRsp->statusCode) ?
+                              eCSR_SCAN_SUCCESS : eCSR_SCAN_FAILURE;
                 break;
             case eCsrScanGetScanChnInfo:
                 pScanChnInfo = (tSmeGetScanChnRsp *)pMsgBuf;
                 /*
                  * status code not available in tSmeGetScanChnRsp, so
-                 * by default considereing it to be success
+                 * by default considering it to be success
                  */
                 scanStatus = eSIR_SME_SUCCESS;
                 csrScanAgeResults(pMac, pScanChnInfo);
                 break;
             case eCsrScanForCapsChange:
+                pScanRsp = (tSirSmeScanRsp *)pMsgBuf;
+                scanStatus = (eSIR_SME_SUCCESS == pScanRsp->statusCode) ?
+                              eCSR_SCAN_SUCCESS : eCSR_SCAN_FAILURE;
                 csrScanProcessScanResults( pMac, pCommand, pScanRsp, &fRemoveCommand );
                 break;
             case eCsrScanP2PFindPeer:
-              scanStatus = ((eSIR_SME_SUCCESS == pScanRsp->statusCode) && (pScanRsp->length > 50)) ? eCSR_SCAN_FOUND_PEER : eCSR_SCAN_FAILURE;
-              csrScanProcessScanResults( pMac, pCommand, pScanRsp, NULL );
-              break;
+                pScanRsp = (tSirSmeScanRsp *)pMsgBuf;
+                scanStatus = ((eSIR_SME_SUCCESS == pScanRsp->statusCode) &&
+                             (pScanRsp->length > 50)) ? eCSR_SCAN_FOUND_PEER : eCSR_SCAN_FAILURE;
+                csrScanProcessScanResults( pMac, pCommand, pScanRsp, NULL );
+                break;
             case eCsrScanSetBGScanParam:
             default:
+                pScanRsp = (tSirSmeScanRsp *)pMsgBuf;
+                scanStatus = (eSIR_SME_SUCCESS == pScanRsp->statusCode) ?
+                              eCSR_SCAN_SUCCESS : eCSR_SCAN_FAILURE;
                 if(csrScanProcessScanResults( pMac, pCommand, pScanRsp, &fRemoveCommand ))
                 {
                     //Not to get channel info if the scan is not a wildcard scan because
@@ -5479,16 +5476,22 @@ eHalStatus csrScanSmeScanResponse( tpAniSirGlobal pMac, void *pMsgBuf )
 
                 csrReleaseScanCommand(pMac, pCommand, scanStatus);
 
-                }
+            }
             smeProcessPendingQueue( pMac );
         }
 #ifdef FEATURE_WLAN_SCAN_PNO
-        else if (pMac->pnoOffload &&
-                 !HAL_STATUS_SUCCESS(csrSavePnoScanResults(pMac, pScanRsp,
-                                                    pScanRsp->sessionId)))
-        {
-            smsLog( pMac, LOGE, "CSR: Unable to store scan results for PNO" );
-            status = eHAL_STATUS_FAILURE;
+        else if (pMac->pnoOffload) {
+            pScanRsp = (tSirSmeScanRsp *)pMsgBuf;
+            if (!HAL_STATUS_SUCCESS(csrSavePnoScanResults(pMac, pScanRsp,
+                                                   pScanRsp->sessionId))) {
+                smsLog( pMac, LOGE, "CSR: Unable to store scan results for PNO" );
+                status = eHAL_STATUS_FAILURE;
+            }
+            else {
+                /* Purge the scan results based on Aging */
+                if (pMac->scan.scanResultCfgAgingTime)
+                    csrPurgeScanResultByAge(pMac);
+            }
         }
 #endif
         else
@@ -5498,12 +5501,18 @@ eHalStatus csrScanSmeScanResponse( tpAniSirGlobal pMac, void *pMsgBuf )
         }
     }
 #ifdef FEATURE_WLAN_SCAN_PNO
-    else if (pMac->pnoOffload &&
-             !HAL_STATUS_SUCCESS(csrSavePnoScanResults(pMac, pScanRsp,
-                                                pScanRsp->sessionId)))
-    {
-        smsLog( pMac, LOGE, "CSR: Unable to store scan results for PNO" );
-        status = eHAL_STATUS_FAILURE;
+    else if (pMac->pnoOffload) {
+        pScanRsp = (tSirSmeScanRsp *)pMsgBuf;
+        if (!HAL_STATUS_SUCCESS(csrSavePnoScanResults(pMac, pScanRsp,
+                                                pScanRsp->sessionId))) {
+            smsLog( pMac, LOGE, "CSR: Unable to store scan results for PNO" );
+            status = eHAL_STATUS_FAILURE;
+        }
+        else {
+            /* Purge the scan results based on Aging */
+            if (pMac->scan.scanResultCfgAgingTime)
+                csrPurgeScanResultByAge(pMac);
+        }
     }
 #endif
     else if (pMac->pnoOffload == FALSE)
@@ -5726,7 +5735,8 @@ eHalStatus csrSendMBScanReq( tpAniSirGlobal pMac, tANI_U16 sessionId,
 
     msgLen = (tANI_U16)(sizeof( tSirSmeScanReq ) - sizeof( pMsg->channelList.channelNumber ) +
                         ( sizeof( pMsg->channelList.channelNumber ) * pScanReq->ChannelInfo.numOfChannels )) +
-                   ( pScanReq->uIEFieldLen ) ;
+                   ( pScanReq->uIEFieldLen ) +
+                   pScanReq->num_vendor_oui * sizeof(struct vendor_oui);
 
     pMsg = vos_mem_malloc(msgLen);
     if ( NULL == pMsg )
@@ -5884,6 +5894,36 @@ eHalStatus csrSendMBScanReq( tpAniSirGlobal pMac, tANI_U16 sessionId,
             if (pScanReq->requestType == eCSR_SCAN_HO_BG_SCAN)
             {
                 pMsg->backgroundScanMode = eSIR_ROAMING_SCAN;
+            }
+
+            pMsg->enable_scan_randomization =
+                                       pScanReq->enable_scan_randomization;
+            if (pMsg->enable_scan_randomization) {
+                vos_mem_copy(pMsg->mac_addr, pScanReq->mac_addr,
+                             VOS_MAC_ADDR_SIZE);
+                vos_mem_copy(pMsg->mac_addr_mask, pScanReq->mac_addr_mask,
+                             VOS_MAC_ADDR_SIZE);
+            }
+
+            pMsg->ie_whitelist = pScanReq->ie_whitelist;
+            if (pMsg->ie_whitelist)
+                vos_mem_copy(pMsg->probe_req_ie_bitmap,
+                             pScanReq->probe_req_ie_bitmap,
+                             PROBE_REQ_BITMAP_LEN * sizeof(uint32_t));
+            pMsg->num_vendor_oui = pScanReq->num_vendor_oui;
+            pMsg->oui_field_len = pScanReq->num_vendor_oui *
+                                  sizeof(struct vendor_oui);
+            pMsg->oui_field_offset = (tANI_U16)(sizeof( tSirSmeScanReq ) -
+                                   sizeof( pMsg->channelList.channelNumber ) +
+                                   (sizeof( pMsg->channelList.channelNumber ) *
+                                   pScanReq->ChannelInfo.numOfChannels )) +
+                                   pScanReq->uIEFieldLen;
+
+            if (pScanReq->num_vendor_oui != 0)
+            {
+                vos_mem_copy((tANI_U8 *)pMsg + pMsg->oui_field_offset,
+                             (uint8_t*)(pScanReq->voui),
+                             pMsg->oui_field_len);
             }
 
         }while(0);
@@ -6319,15 +6359,9 @@ eHalStatus csrScanBGScanEnable(tpAniSirGlobal pMac)
                 break;
             }
         }while(0);
-        //BG scan results are reported automatically by PE to SME once the scan is done.
-        //No need to fetch the results explicitly.
-        //csrScanStartGetResultTimer(pMac);
-        csrScanStartResultAgingTimer(pMac);
     }
     else
     {
-        //We don't have BG scan so stop the aging timer
-        csrScanStopResultAgingTimer(pMac);
         smsLog(pMac, LOGE, FL("cannot continue because the bgscan interval is 0"));
         status = eHAL_STATUS_INVALID_PARAMETER;
     }
@@ -6355,6 +6389,7 @@ eHalStatus csrScanCopyRequest(tpAniSirGlobal pMac, tCsrScanRequest *pDstReq, tCs
             pDstReq->pIEField = NULL;
             pDstReq->ChannelInfo.ChannelList = NULL;
             pDstReq->SSIDs.SSIDList = NULL;
+            pDstReq->voui = NULL;
 
             if(pSrcReq->uIEFieldLen == 0)
             {
@@ -6530,6 +6565,35 @@ eHalStatus csrScanCopyRequest(tpAniSirGlobal pMac, tCsrScanRequest *pDstReq, tCs
             pDstReq->p2pSearch = pSrcReq->p2pSearch;
             pDstReq->skipDfsChnlInP2pSearch = pSrcReq->skipDfsChnlInP2pSearch;
 
+            if (pSrcReq->num_vendor_oui == 0)
+            {
+                pDstReq->num_vendor_oui = 0;
+                pDstReq->voui = NULL;
+            }
+            else
+            {
+                pDstReq->voui = vos_mem_malloc(pSrcReq->num_vendor_oui *
+                                         sizeof(*pDstReq->voui));
+                if (NULL == pDstReq->voui)
+                        status = eHAL_STATUS_FAILURE;
+                else
+                        status = eHAL_STATUS_SUCCESS;
+
+                if (HAL_STATUS_SUCCESS(status))
+                {
+                    pDstReq->num_vendor_oui = pSrcReq->num_vendor_oui;
+                    vos_mem_copy(pDstReq->voui,
+                                 pSrcReq->voui,
+                                 pSrcReq->num_vendor_oui *
+                                 sizeof(*pDstReq->voui));
+                }
+                else
+                {
+                    pDstReq->num_vendor_oui = 0;
+                    smsLog(pMac, LOGE, FL("No memory for voui"));
+                    break;
+                }
+            }
         }
     }while(0);
 
@@ -6564,6 +6628,13 @@ eHalStatus csrScanFreeRequest(tpAniSirGlobal pMac, tCsrScanRequest *pReq)
     }
     pReq->SSIDs.numOfSSIDs = 0;
 
+    if(pReq->voui)
+    {
+        vos_mem_free(pReq->voui);
+        pReq->voui = NULL;
+    }
+    pReq->num_vendor_oui = 0;
+
     return eHAL_STATUS_SUCCESS;
 }
 
@@ -6583,14 +6654,8 @@ void csrScanCallCallback(tpAniSirGlobal pMac, tSmeCmd *pCommand, eCsrScanStatus 
 
 void csrScanStopTimers(tpAniSirGlobal pMac)
 {
-    csrScanStopResultAgingTimer(pMac);
     csrScanStopIdleScanTimer(pMac);
     csrScanStopGetResultTimer(pMac);
-    if(0 != pMac->scan.scanResultCfgAgingTime )
-    {
-        csrScanStopResultCfgAgingTimer(pMac);
-    }
-
 }
 
 
@@ -6767,138 +6832,7 @@ static void csrStaApConcTimerHandler(void *pv)
 }
 #endif
 
-eHalStatus csrScanStartResultAgingTimer(tpAniSirGlobal pMac)
-{
-    eHalStatus status = eHAL_STATUS_FAILURE;
-
-    if(pMac->scan.fScanEnable)
-    {
-        status = vos_timer_start(&pMac->scan.hTimerResultAging, CSR_SCAN_RESULT_AGING_INTERVAL/VOS_TIMER_TO_MS_UNIT);
-    }
-    return (status);
-}
-
-eHalStatus csrScanStartResultCfgAgingTimer(tpAniSirGlobal pMac)
-{
-    eHalStatus status = eHAL_STATUS_FAILURE;
-
-    if(pMac->scan.fScanEnable)
-    {
-        status = vos_timer_start(&pMac->scan.hTimerResultCfgAging, CSR_SCAN_RESULT_CFG_AGING_INTERVAL/VOS_TIMER_TO_MS_UNIT);
-    }
-    return (status);
-}
-
-eHalStatus csrScanStopResultAgingTimer(tpAniSirGlobal pMac)
-{
-    return (vos_timer_stop(&pMac->scan.hTimerResultAging));
-}
-
-eHalStatus csrScanStopResultCfgAgingTimer(tpAniSirGlobal pMac)
-{
-    return (vos_timer_stop(&pMac->scan.hTimerResultCfgAging));
-}
-
-//This function returns the maximum time a BSS is allowed in the scan result.
-//The time varies base on connection and power saving factors.
-//Not connected, No PS
-//Not connected, with PS
-//Connected w/o traffic, No PS
-//Connected w/o traffic, with PS
-//Connected w/ traffic, no PS -- Not supported
-//Connected w/ traffic, with PS -- Not supported
-//the return unit is in seconds.
-tANI_U32 csrScanGetAgeOutTime(tpAniSirGlobal pMac)
-{
-    tANI_U32 nRet;
-
-    if(pMac->scan.nAgingCountDown)
-    {
-        //Calculate what should be the timeout value for this
-        nRet = pMac->scan.nLastAgeTimeOut * pMac->scan.nAgingCountDown;
-        pMac->scan.nAgingCountDown--;
-    }
-    else
-    {
-        if( csrIsAllSessionDisconnected( pMac ) )
-        {
-            if(pmcIsPowerSaveEnabled(pMac, ePMC_IDLE_MODE_POWER_SAVE))
-            {
-                nRet = pMac->roam.configParam.scanAgeTimeNCPS;
-            }
-            else
-            {
-                nRet = pMac->roam.configParam.scanAgeTimeNCNPS;
-            }
-        }
-        else
-        {
-            if(pmcIsPowerSaveEnabled(pMac, ePMC_BEACON_MODE_POWER_SAVE))
-            {
-                nRet = pMac->roam.configParam.scanAgeTimeCPS;
-            }
-            else
-            {
-                nRet = pMac->roam.configParam.scanAgeTimeCNPS;
-            }
-        }
-        //If state-change causing aging time out change, we want to delay it somewhat to avoid
-        //unnecessary removal of BSS. This is mostly due to transition from connect to disconnect.
-        if(pMac->scan.nLastAgeTimeOut > nRet)
-        {
-            if(nRet)
-            {
-                pMac->scan.nAgingCountDown = (pMac->scan.nLastAgeTimeOut / nRet);
-            }
-            pMac->scan.nLastAgeTimeOut = nRet;
-            nRet *= pMac->scan.nAgingCountDown;
-        }
-        else
-        {
-            pMac->scan.nLastAgeTimeOut = nRet;
-        }
-    }
-
-    return (nRet);
-}
-
-
-void csrScanResultAgingTimerHandler(void *pv)
-{
-    tpAniSirGlobal pMac = PMAC_STRUCT( pv );
-    tANI_BOOLEAN fDisconnected = csrIsAllSessionDisconnected(pMac);
-
-    //no scan, no aging
-    if (pMac->scan.fScanEnable &&
-        (((eANI_BOOLEAN_FALSE == fDisconnected) && pMac->roam.configParam.bgScanInterval)
-        || (fDisconnected && (pMac->scan.fCancelIdleScan == eANI_BOOLEAN_FALSE))
-        || (pMac->fScanOffload))
-        )
-    {
-        tListElem *pEntry, *tmpEntry;
-        tCsrScanResult *pResult;
-        tANI_TIMESTAMP ageOutTime = (tANI_TIMESTAMP)(csrScanGetAgeOutTime(pMac) * PAL_TICKS_PER_SECOND); //turn it into 10ms units
-        tANI_TIMESTAMP curTime = (tANI_TIMESTAMP)palGetTickCount(pMac->hHdd);
-
-        csrLLLock(&pMac->scan.scanResultList);
-        pEntry = csrLLPeekHead( &pMac->scan.scanResultList, LL_ACCESS_NOLOCK );
-        while( pEntry )
-        {
-            tmpEntry = csrLLNext(&pMac->scan.scanResultList, pEntry, LL_ACCESS_NOLOCK);
-            pResult = GET_BASE_ADDR( pEntry, tCsrScanResult, Link );
-            if((curTime - pResult->Result.BssDescriptor.nReceivedTime) > ageOutTime)
-            {
-                smsLog(pMac, LOGW, " age out due to time out");
-                csrScanAgeOutBss(pMac, pResult);
-            }
-            pEntry = tmpEntry;
-        }
-        csrLLUnlock(&pMac->scan.scanResultList);
-    }
-    vos_timer_start(&pMac->scan.hTimerResultAging, CSR_SCAN_RESULT_AGING_INTERVAL/VOS_TIMER_TO_MS_UNIT);
-}
-
-static void csrScanResultCfgAgingTimerHandler(void *pv)
+static void csrPurgeScanResultByAge(void *pv)
 {
     tpAniSirGlobal pMac = PMAC_STRUCT( pv );
     tListElem *pEntry, *tmpEntry;
@@ -6908,6 +6842,7 @@ static void csrScanResultCfgAgingTimerHandler(void *pv)
 
     csrLLLock(&pMac->scan.scanResultList);
     pEntry = csrLLPeekHead( &pMac->scan.scanResultList, LL_ACCESS_NOLOCK );
+    smsLog(pMac, LOG1, FL(" Ageout time=%lu"),ageOutTime);
     while( pEntry )
     {
         tmpEntry = csrLLNext(&pMac->scan.scanResultList, pEntry, LL_ACCESS_NOLOCK);
@@ -6920,7 +6855,6 @@ static void csrScanResultCfgAgingTimerHandler(void *pv)
         pEntry = tmpEntry;
     }
     csrLLUnlock(&pMac->scan.scanResultList);
-    vos_timer_start(&pMac->scan.hTimerResultCfgAging, CSR_SCAN_RESULT_CFG_AGING_INTERVAL/VOS_TIMER_TO_MS_UNIT);
 }
 
 eHalStatus csrScanStartIdleScanTimer(tpAniSirGlobal pMac, tANI_U32 interval)
@@ -7140,8 +7074,6 @@ eHalStatus csrScanStartIdleScan(tpAniSirGlobal pMac)
         csrScanBGScanAbort(pMac);
         //Stop get result timer because idle scan gets scan result out of PE
         csrScanStopGetResultTimer(pMac);
-        //Enable aging timer since idle scan is going on
-        csrScanStartResultAgingTimer(pMac);
     }
     pMac->scan.fCancelIdleScan = eANI_BOOLEAN_FALSE;
     status = csrScanTriggerIdleScan(pMac, &nTime);
@@ -7498,6 +7430,7 @@ eHalStatus csrScanGetBKIDCandidateList(tpAniSirGlobal pMac, tANI_U32 sessionId,
                     }
                     csrScanResultPurge(pMac, hBSSList);
                 }//Have scan result
+                csrFreeScanFilter(pMac, pScanFilter);
             }
             vos_mem_free(pScanFilter);
         }
@@ -8110,13 +8043,6 @@ eHalStatus csrProcessSetBGScanParam(tpAniSirGlobal pMac, tSmeCmd *pCommand)
     //Not set the background scan interval if not connected because bd scan should not be run if not connected
     if(!csrIsAllSessionDisconnected(pMac))
     {
-        //If disbaling BG scan here, we need to stop aging as well
-        if(pScanReq->scanInterval == 0)
-        {
-            //Stop aging because no new result is coming in
-            csrScanStopResultAgingTimer(pMac);
-        }
-
 #ifdef FEATURE_WLAN_DIAG_SUPPORT_CSR
         {
             vos_log_scan_pkt_type *pScanLog = NULL;
@@ -8586,7 +8512,18 @@ eHalStatus csrScanSavePreferredNetworkFound(tpAniSirGlobal pMac,
    }
    else
    {
-      pBssDescr->channelId = pParsedFrame->channelNumber;
+      /*
+       * If Probe Responce received in PNO indication does not
+       * contain DSParam IE or HT Info IE then add dummy channel
+       * to the received BSS info so that Scan result received as
+       * a part of PNO is updated to the supplicant. Specially
+       * applicable in case of AP configured in 11A only mode.
+       */
+      if ((pMac->roam.configParam.bandCapability == eCSR_BAND_ALL) ||
+          (pMac->roam.configParam.bandCapability == eCSR_BAND_24))
+          pBssDescr->channelId = 1;
+      else if (pMac->roam.configParam.bandCapability == eCSR_BAND_5G)
+         pBssDescr->channelId = 36;
    }
 
    if ((pBssDescr->channelId > 0) && (pBssDescr->channelId < 15))

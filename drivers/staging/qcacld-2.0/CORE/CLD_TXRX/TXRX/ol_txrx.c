@@ -989,10 +989,10 @@ ol_txrx_vdev_detach(
 
         for (i = 0; i < OL_TX_VDEV_NUM_QUEUES; i++) {
             txq = &vdev->txqs[i];
-            ol_tx_queue_free(pdev, txq, (i + OL_TX_NUM_TIDS));
+            ol_tx_queue_free(pdev, txq, (i + OL_TX_NUM_TIDS), false);
         }
     }
-    #endif /* defined(CONFIG_HL_SUPPORT) */
+#endif /* defined(CONFIG_HL_SUPPORT) */
 
     adf_os_spin_lock_bh(&vdev->ll_pause.mutex);
     adf_os_timer_cancel(&vdev->ll_pause.timer);
@@ -1534,7 +1534,7 @@ ol_txrx_peer_unref_delete(ol_txrx_peer_handle peer)
 
             for (i = 0; i < OL_TX_NUM_TIDS; i++) {
                 txq = &peer->txqs[i];
-                ol_tx_queue_free(pdev, txq, i);
+                ol_tx_queue_free(pdev, txq, i, true);
             }
         }
         #endif /* defined(CONFIG_HL_SUPPORT) */
@@ -1657,6 +1657,31 @@ ol_txrx_get_tx_pending(ol_txrx_pdev_handle pdev_handle)
     }
 
     return (total - pdev->tx_desc.num_free);
+}
+
+/*
+ * ol_txrx_get_queue_status() - get vdev tx ll queues status
+ * pdev_handle: pdev handle
+ *
+ * Return: A_OK - if all queues are empty
+ *         A_ERROR - if any queue is not empty
+ */
+A_STATUS
+ol_txrx_get_queue_status(ol_txrx_pdev_handle pdev_handle)
+{
+	struct ol_txrx_pdev_t *pdev = (ol_txrx_pdev_handle)pdev_handle;
+	struct ol_txrx_vdev_t *vdev;
+	A_STATUS status = A_OK;
+
+	TAILQ_FOREACH(vdev, &pdev->vdev_list, vdev_list_elem) {
+		if ((vdev->ll_pause.paused_reason & OL_TXQ_PAUSE_REASON_FW) &&
+			 vdev->ll_pause.txq.depth) {
+			status = A_ERROR;
+			break;
+		}
+	}
+
+	return status;
 }
 
 void
@@ -2239,6 +2264,8 @@ ol_txrx_ipa_uc_op_response(
 {
    if (pdev->ipa_uc_op_cb) {
       pdev->ipa_uc_op_cb(op_msg, pdev->osif_dev);
+   } else {
+      adf_os_mem_free(op_msg);
    }
 }
 

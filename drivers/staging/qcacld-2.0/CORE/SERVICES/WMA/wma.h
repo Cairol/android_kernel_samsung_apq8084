@@ -546,7 +546,6 @@ struct wma_txrx_node {
 #if defined WLAN_FEATURE_VOWIFI_11R
         void    *staKeyParams;
 #endif
-	v_BOOL_t ps_enabled;
 	u_int32_t dtim_policy;
 	u_int32_t peer_count;
 	v_BOOL_t roam_synch_in_progress;
@@ -557,6 +556,8 @@ struct wma_txrx_node {
 #endif
 	uint32_t alt_modulated_dtim;
 	bool alt_modulated_dtim_enabled;
+	bool is_vdev_valid;
+
 };
 
 #if defined(QCA_WIFI_FTM)
@@ -788,6 +789,7 @@ typedef struct {
 
 	uint32_t wow_wakeup_enable_mask;
 	uint32_t wow_wakeup_disable_mask;
+	tSirAddonPsReq psSetting;
 }t_wma_handle, *tp_wma_handle;
 
 struct wma_target_cap {
@@ -1427,13 +1429,6 @@ struct wma_decap_info_t {
 	int32_t hdr_len;
 };
 
-enum powersave_mode {
-	PS_NOT_SUPPORTED = 0,
-	PS_LEGACY_NODEEPSLEEP = 1,
-	PS_QPOWER_NODEEPSLEEP = 2,
-	PS_LEGACY_DEEPSLEEP = 3,
-	PS_QPOWER_DEEPSLEEP = 4
-};
 
 #define WMA_DEFAULT_MAX_PSPOLL_BEFORE_WAKE 1
 

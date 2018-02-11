@@ -99,6 +99,7 @@ typedef tANI_U8 tSirVersionString[SIR_VERSION_STRING_LEN];
 #define MAXNUM_PERIODIC_TX_PTRNS 6
 
 #define WIFI_SCANNING_MAC_OUI_LENGTH 3
+#define PROBE_REQ_BITMAP_LEN 8
 
 
 #ifdef FEATURE_WLAN_EXTSCAN
@@ -942,6 +943,15 @@ typedef struct sSirSmeScanReq
     tANI_U16             uIEFieldLen;
     tANI_U16             uIEFieldOffset;
 
+    uint32_t enable_scan_randomization;
+    uint8_t mac_addr[VOS_MAC_ADDR_SIZE];
+    uint8_t mac_addr_mask[VOS_MAC_ADDR_SIZE];
+    bool ie_whitelist;
+    uint32_t probe_req_ie_bitmap[PROBE_REQ_BITMAP_LEN];
+    uint32_t num_vendor_oui;
+    uint32_t oui_field_len;
+    uint32_t oui_field_offset;
+
     //channelList MUST be the last field of this structure
     tSirChannelList channelList;
     /*-----------------------------
@@ -960,7 +970,10 @@ typedef struct sSirSmeScanReq
       ----------------------------- <--+
       ... variable size uIEFiled
       up to uIEFieldLen (can be 0)
-      -----------------------------*/
+      -----------------------------
+      ... variable size upto num_vendor_oui
+      struct vendor_oui voui;
+    */
 } tSirSmeScanReq, *tpSirSmeScanReq;
 
 typedef struct sSirSmeScanAbortReq
@@ -3300,6 +3313,7 @@ typedef struct sSirWPSProbeRspIE {
 #define SIR_WPS_BEACON_SELECTEDREGISTRACFGMETHOD_PRESENT    0x00000020
 #define SIR_WPS_BEACON_UUIDE_PRESENT    0x00000080
 #define SIR_WPS_BEACON_RF_BANDS_PRESENT    0x00000100
+#define SIR_WPS_UUID_LEN 16
 
 typedef struct sSirWPSBeaconIE {
    v_U32_t  FieldPresent;
@@ -3309,7 +3323,7 @@ typedef struct sSirWPSBeaconIE {
    v_BOOL_t SelectedRegistra;  //BOOL:  indicates if the user has recently activated a Registrar to add an Enrollee.
    v_U16_t  DevicePasswordID;  // Device Password ID
    v_U16_t  SelectedRegistraCfgMethod; // Selected Registrar config method
-   v_U8_t   UUID_E[16];        // Unique identifier of the AP.
+   v_U8_t   UUID_E[SIR_WPS_UUID_LEN];   /* Unique identifier of the AP */
    v_U8_t   RFBand;           // RF bands available on the AP
 } tSirWPSBeaconIE;
 
@@ -3368,7 +3382,6 @@ typedef struct sSirSetHT2040Mode
 } tSirSetHT2040Mode, *tpSirSetHT2040Mode;
 #endif
 
-#define SIR_WPS_UUID_LEN 16
 #define SIR_WPS_PBC_WALK_TIME   120  // 120 Second
 
 typedef struct sSirWPSPBCSession {
@@ -3721,6 +3734,15 @@ typedef struct sSirPNOScanReq {
 	uint8_t         p24GProbeTemplate[SIR_PNO_MAX_PB_REQ_SIZE];
 	uint16_t        us5GProbeTemplateLen;
 	uint8_t         p5GProbeTemplate[SIR_PNO_MAX_PB_REQ_SIZE];
+
+	/* mac address randomization attributes */
+	uint32_t enable_pno_scan_randomization;
+	uint8_t mac_addr[VOS_MAC_ADDR_SIZE];
+	uint8_t mac_addr_mask[VOS_MAC_ADDR_SIZE];
+	bool ie_whitelist;
+	uint32_t probe_req_ie_bitmap[PROBE_REQ_BITMAP_LEN];
+	uint32_t num_vendor_oui;
+	/* followed by one or more struct vendor_oui */
 } tSirPNOScanReq, *tpSirPNOScanReq;
 
 typedef struct sSirSetRSSIFilterReq
@@ -4238,6 +4260,7 @@ typedef struct
     tANI_U16            transactionId; // Transaction ID for cmd
     tSirResultCodes        statusCode;
     tSirMacAddr            peerMac;
+    uint16_t            sta_idx;
 }tSirTdlsLinkEstablishReqRsp, *tpSirTdlsLinkEstablishReqRsp;
 
 /* TDLS Request struct SME-->PE */
@@ -4309,6 +4332,7 @@ typedef struct sSirActiveModeSetBcnFilterReq
    tANI_U16               messageType;
    tANI_U16               length;
    tANI_U8                seesionId;
+   tSirMacAddr            bssid;
 } tSirSetActiveModeSetBncFilterReq, *tpSirSetActiveModeSetBncFilterReq;
 
 //Reset AP Caps Changed
@@ -4367,6 +4391,16 @@ typedef struct sSirScanOffloadReq {
     tSirP2pScanType p2pScanType;
     tANI_U16 uIEFieldLen;
     tANI_U16 uIEFieldOffset;
+
+    uint32_t enable_scan_randomization;
+    uint8_t mac_addr[VOS_MAC_ADDR_SIZE];
+    uint8_t mac_addr_mask[VOS_MAC_ADDR_SIZE];
+    bool ie_whitelist;
+    uint32_t probe_req_ie_bitmap[PROBE_REQ_BITMAP_LEN];
+    uint32_t num_vendor_oui;
+    uint32_t oui_field_len;
+    uint32_t oui_field_offset;
+
     tSirChannelList channelList;
     /*-----------------------------
       sSirScanOffloadReq....
@@ -4384,23 +4418,38 @@ typedef struct sSirScanOffloadReq {
       ----------------------------- <--+
       ... variable size uIEField
       up to uIEFieldLen (can be 0)
-      -----------------------------*/
+      -----------------------------
+      ... variable size upto num_vendor_oui
+      struct vendor_oui voui;
+      ------------------------*/
 } tSirScanOffloadReq, *tpSirScanOffloadReq;
 
-typedef enum sSirScanEventType {
-    SCAN_EVENT_STARTED=0x1,          /* Scan command accepted by FW */
-    SCAN_EVENT_COMPLETED=0x2,        /* Scan has been completed by FW */
-    SCAN_EVENT_BSS_CHANNEL=0x4,      /* FW is going to move to HOME channel */
-    SCAN_EVENT_FOREIGN_CHANNEL = 0x8,/* FW is going to move to FORIEGN channel */
-    SCAN_EVENT_DEQUEUED=0x10,       /* scan request got dequeued */
-    SCAN_EVENT_PREEMPTED=0x20,      /* preempted by other high priority scan */
-    SCAN_EVENT_START_FAILED=0x40,   /* scan start failed */
-    SCAN_EVENT_RESTARTED=0x80,      /*scan restarted*/
-    SCAN_EVENT_MAX=0x8000
-} tSirScanEventType;
+/**
+ * sir_scan_event_type - scan event types used in LIM
+ * @SIR_SCAN_EVENT_STARTED - scan command accepted by FW
+ * @SIR_SCAN_EVENT_COMPLETED - scan has been completed by FW
+ * @SIR_SCAN_EVENT_BSS_CHANNEL - FW is going to move to HOME channel
+ * @SIR_SCAN_EVENT_FOREIGN_CHANNEL - FW is going to move to FORIEGN channel
+ * @SIR_SCAN_EVENT_DEQUEUED - scan request got dequeued
+ * @SIR_SCAN_EVENT_PREEMPTED - preempted by other high priority scan
+ * @SIR_SCAN_EVENT_START_FAILED - scan start failed
+ * @SIR_SCAN_EVENT_RESTARTED - scan restarted
+ * @SIR_SCAN_EVENT_MAX - max value for event type
+*/
+enum sir_scan_event_type {
+    SIR_SCAN_EVENT_STARTED=0x1,
+    SIR_SCAN_EVENT_COMPLETED=0x2,
+    SIR_SCAN_EVENT_BSS_CHANNEL=0x4,
+    SIR_SCAN_EVENT_FOREIGN_CHANNEL = 0x8,
+    SIR_SCAN_EVENT_DEQUEUED=0x10,
+    SIR_SCAN_EVENT_PREEMPTED=0x20,
+    SIR_SCAN_EVENT_START_FAILED=0x40,
+    SIR_SCAN_EVENT_RESTARTED=0x80,
+    SIR_SCAN_EVENT_MAX=0x8000
+};
 
 typedef struct sSirScanOffloadEvent{
-    tSirScanEventType event;
+    enum sir_scan_event_type event;
     tSirResultCodes reasonCode;
     tANI_U32 chanFreq;
     tANI_U32 requestor;
@@ -5427,9 +5476,25 @@ typedef struct
   tANI_U8   stopReq;
 } tSirLLStatsClearReq, *tpSirLLStatsClearReq;
 
+/**
+ * struct vendor_oui - probe request ie vendor oui information
+ * @oui_type: type of the vendor oui (3 valid octets)
+ * @oui_subtype: subtype of the vendor oui (1 valid octet)
+ */
+struct vendor_oui {
+	uint32_t oui_type;
+	uint32_t oui_subtype;
+};
+
 typedef struct
 {
     tANI_U8 oui[WIFI_SCANNING_MAC_OUI_LENGTH];
+    uint32_t vdev_id;
+    uint32_t enb_probe_req_sno_randomization;
+    bool ie_whitelist;
+    uint32_t probe_req_ie_bitmap[PROBE_REQ_BITMAP_LEN];
+    uint32_t num_vendor_oui;
+    /* Followed by 0 or more struct vendor_oui */
 } tSirScanMacOui, *tpSirScanMacOui;
 
 /*---------------------------------------------------------------------------
@@ -5971,4 +6036,45 @@ struct rssi_breach_event {
 	v_MACADDR_t  curr_bssid;
 };
 
+/**
+ * struct sir_del_all_tdls_peers - delete all tdls peers
+ * @msg_type: type of message
+ * @msg_len: length of message
+ * bssid: bssid of peer device
+ */
+struct sir_del_all_tdls_peers {
+	uint16_t msg_type;
+	uint16_t msg_len;
+	tSirMacAddr bssid;
+};
+
+/**
+ * enum powersave_qpower_mode: QPOWER modes
+ * @QPOWER_DISABLED: Qpower is disabled
+ * @QPOWER_ENABLED: Qpower is enabled
+ * @QPOWER_DUTY_CYCLING: Qpower is enabled with duty cycling
+ */
+enum powersave_qpower_mode {
+	QPOWER_DISABLED = 0,
+	QPOWER_ENABLED = 1,
+	QPOWER_DUTY_CYCLING = 2
+};
+
+/**
+ * enum powersave_qpower_mode: powersave_mode
+ * @PS_NOT_SUPPORTED: Power save is not supported
+ * @PS_LEGACY_NODEEPSLEEP: Legacy power save enabled and deep sleep disabled
+ * @PS_QPOWER_NODEEPSLEEP: QPOWER enabled and deep sleep disabled
+ * @PS_LEGACY_DEEPSLEEP: Legacy power save enabled and deep sleep enabled
+ * @PS_QPOWER_DEEPSLEEP: QPOWER enabled and deep sleep enabled
+ * @PS_DUTY_CYCLING_QPOWER: QPOWER enabled in duty cycling mode
+ */
+enum powersave_mode {
+	PS_NOT_SUPPORTED = 0,
+	PS_LEGACY_NODEEPSLEEP = 1,
+	PS_QPOWER_NODEEPSLEEP = 2,
+	PS_LEGACY_DEEPSLEEP = 3,
+	PS_QPOWER_DEEPSLEEP = 4,
+	PS_DUTY_CYCLING_QPOWER = 5
+};
 #endif /* __SIR_API_H */

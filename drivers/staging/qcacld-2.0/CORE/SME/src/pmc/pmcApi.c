@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2016 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -1169,7 +1169,7 @@ static void pmcProcessResponse( tpAniSirGlobal pMac, tSirSmeRsp *pMsg )
     {
         pCommand = GET_BASE_ADDR(pEntry, tSmeCmd, Link);
 
-        pmcLog(pMac, LOG2, FL("process message = %d"), pMsg->messageType);
+        pmcLog(pMac, LOG2, FL("process message = 0x%x"), pMsg->messageType);
 
     /* Process each different type of message. */
     switch (pMsg->messageType)
@@ -2857,14 +2857,17 @@ eHalStatus pmcSetPreferredNetworkList
         return eHAL_STATUS_FAILURE;
     }
 
-    pRequestBuf = vos_mem_malloc(sizeof(tSirPNOScanReq));
+    pRequestBuf = vos_mem_malloc(sizeof(tSirPNOScanReq) +
+                  (pRequest->num_vendor_oui) *
+                  (sizeof(struct vendor_oui)));
     if (NULL == pRequestBuf)
     {
         VOS_TRACE(VOS_MODULE_ID_SME, VOS_TRACE_LEVEL_ERROR, "%s: Not able to allocate memory for PNO request", __func__);
         return eHAL_STATUS_FAILED_ALLOC;
     }
 
-    vos_mem_copy(pRequestBuf, pRequest, sizeof(tSirPNOScanReq));
+    vos_mem_copy(pRequestBuf, pRequest, sizeof(tSirPNOScanReq) +
+                 (pRequest->num_vendor_oui) * (sizeof(struct vendor_oui)));
 
     /*Must translate the mode first*/
     ucDot11Mode = (tANI_U8) csrTranslateToWNICfgDot11Mode(pMac,
@@ -3575,7 +3578,7 @@ eHalStatus PmcOffloadEnableStaModePowerSave(tHalHandle hHal,
         {
             /* Successfully Queued Enabling Sta Mode Ps Request */
             smsLog(pMac, LOG2,
-                   FL("Successfull Queued Enabling Sta Mode Ps Request"));
+                   FL("Successful Queued Enabling Sta Mode Ps Request"));
 
             pmc->configStaPsEnabled = TRUE;
             return eHAL_STATUS_SUCCESS;
@@ -3609,12 +3612,9 @@ eHalStatus PmcOffloadDisableStaModePowerSave(tHalHandle hHal,
     tpPsOffloadPerSessionInfo pmc = &pMac->pmcOffloadInfo.pmc[sessionId];
     eHalStatus status = eHAL_STATUS_SUCCESS;
 
-    if(pmc->configStaPsEnabled)
-    {
+    if (pmc->configStaPsEnabled) {
         status = pmcOffloadDisableStaPsHandler(pMac, sessionId);
-    }
-    else
-    {
+    } else {
         /*
          * configStaPsEnabled is the master flag
          * to enable sta mode power save

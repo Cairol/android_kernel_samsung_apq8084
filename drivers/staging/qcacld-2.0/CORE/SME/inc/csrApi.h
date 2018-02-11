@@ -309,6 +309,14 @@ typedef struct tagCsrScanRequest
     tANI_BOOLEAN p2pSearch;
     tANI_BOOLEAN skipDfsChnlInP2pSearch;
     tANI_BOOLEAN bcnRptReqScan;     //is Scan issued by Beacon Report Request
+
+    uint32_t enable_scan_randomization;
+    uint8_t mac_addr[VOS_MAC_ADDR_SIZE];
+    uint8_t mac_addr_mask[VOS_MAC_ADDR_SIZE];
+    bool ie_whitelist;
+    uint32_t probe_req_ie_bitmap[PROBE_REQ_BITMAP_LEN];
+    uint32_t num_vendor_oui;
+    struct vendor_oui *voui;
 }tCsrScanRequest;
 
 typedef struct tagCsrBGScanRequest
@@ -618,6 +626,7 @@ typedef enum
     eCSR_ROAM_RESULT_ADD_TDLS_PEER,
     eCSR_ROAM_RESULT_UPDATE_TDLS_PEER,
     eCSR_ROAM_RESULT_DELETE_TDLS_PEER,
+    eCSR_ROAM_TDLS_CHECK_BMPS,
     eCSR_ROAM_RESULT_TEARDOWN_TDLS_PEER_IND,
     eCSR_ROAM_RESULT_DELETE_ALL_TDLS_PEER_IND,
     eCSR_ROAM_RESULT_LINK_ESTABLISH_REQ_RSP,
@@ -1536,6 +1545,7 @@ typedef struct tagCsrLinkEstablishParams
     tSirMacAddr peerMac;
     tANI_U8 uapsdQueues;
     tANI_U8 maxSp;
+    uint8_t qos;
     tANI_U8 isBufSta;
     tANI_U8 isOffChannelSupported;
     tANI_U8 isResponder;

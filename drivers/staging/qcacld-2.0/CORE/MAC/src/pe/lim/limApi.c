@@ -871,7 +871,6 @@ tSirRetStatus peOpen(tpAniSirGlobal pMac, tMacOpenParameters *pMacOpenParam)
         status = eSIR_FAILURE;
         goto pe_open_lock_fail;
     }
-    pMac->lim.deauthMsgCnt = 0;
 
     /*
      * peOpen is successful by now, so it is right time to initialize
@@ -1107,6 +1106,21 @@ limPostMsgApi(tpAniSirGlobal pMac, tSirMsgQ *pMsg)
 
 } /*** end limPostMsgApi() ***/
 
+/**
+ * lim_post_msg_high_pri() - posts high priority pe message
+ * @mac: mac context
+ * @msg: message to be posted
+ *
+ * This function is used to post high priority pe message
+ *
+ * Return: returns value returned by vos_mq_post_message_by_priority
+ */
+uint32_t
+lim_post_msg_high_pri(tpAniSirGlobal mac, tSirMsgQ *msg)
+{
+	return vos_mq_post_message_by_priority(VOS_MQ_ID_PE, (vos_msg_t *)msg,
+					       HIGH_PRIORITY);
+}
 
 /*--------------------------------------------------------------------------
 
@@ -1143,13 +1157,12 @@ tSirRetStatus pePostMsgApi(tpAniSirGlobal pMac, tSirMsgQ *pMsg)
 
 tSirRetStatus peProcessMessages(tpAniSirGlobal pMac, tSirMsgQ* pMsg)
 {
-   if(pMac->gDriverType == eDRIVER_TYPE_MFG)
-   {
+   if (ANI_DRIVER_TYPE(pMac) == eDRIVER_TYPE_MFG) {
       return eSIR_SUCCESS;
    }
    /**
-    *   If the Message to be handled is for CFG Module call the CFG Msg Handler and
-    *   for all the other cases post it to LIM
+    * If the Message to be handled is for CFG Module call the CFG Msg Handler
+    * and for all the other cases post it to LIM
     */
     if ( SIR_CFG_PARAM_UPDATE_IND != pMsg->type && IS_CFG_MSG(pMsg->type))
         cfgProcessMbMsg(pMac, (tSirMbMsg*)pMsg->bodyptr);
@@ -2227,7 +2240,7 @@ void limRoamOffloadSynchInd(tpAniSirGlobal pMac, tpSirMsgQ pMsg)
        return;
      }
      /* Nothing to be done if the session is not in STA mode */
-     if (eLIM_STA_ROLE != psessionEntry->limSystemRole) {
+     if (!LIM_IS_STA_ROLE(psessionEntry)) {
         PELOGE(limLog(pMac, LOGE, FL("psessionEntry is not in STA mode"));)
         return;
      }
@@ -2466,9 +2479,8 @@ tMgmtFrmDropReason limIsPktCandidateForDrop(tpAniSirGlobal pMac, tANI_U8 *pRxPac
     {
         pHdr = WDA_GET_RX_MAC_HEADER(pRxPacketInfo);
         psessionEntry = peFindSessionByBssid(pMac, pHdr->bssId, &sessionId);
-        if ((psessionEntry &&
-                    psessionEntry->limSystemRole != eLIM_STA_IN_IBSS_ROLE) ||
-                (!psessionEntry))
+        if ((psessionEntry && !LIM_IS_IBSS_ROLE(psessionEntry)) ||
+            (!psessionEntry))
             return eMGMT_DROP_NO_DROP;
 
         //Drop the Probe Request in IBSS mode, if STA did not send out the last beacon
