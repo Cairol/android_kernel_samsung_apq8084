@@ -187,6 +187,7 @@ static int   enable_dfs_chan_scan = -1;
 
 #ifndef MODULE
 static int wlan_hdd_inited;
+static char fwpath_mode_local[BUF_LEN];
 #endif
 
 /*
@@ -5208,6 +5209,9 @@ static int hdd_driver_command(hdd_adapter_t *pAdapter,
            ret = hdd_driver_rxfilter_comand_handler(command, pAdapter, false);
        } else if (strncmp(command, "RXFILTER-ADD", 12) == 0) {
            ret = hdd_driver_rxfilter_comand_handler(command, pAdapter, true);
+       } else if (strncmp(command, "STOP", 4) == 0) {
+          hddLog(LOG1, FL("STOP command"));
+          pHddCtx->driver_being_stopped = true;
        } else {
            MTRACE(vos_trace(VOS_MODULE_ID_HDD,
                             TRACE_CODE_HDD_UNSUPPORTED_IOCTL,
@@ -6866,17 +6870,19 @@ static int __hdd_open(struct net_device *dev)
    hdd_context_t *pHddCtx =  WLAN_HDD_GET_CTX(pAdapter);
    hdd_adapter_list_node_t *pAdapterNode = NULL, *pNext = NULL;
    VOS_STATUS status;
-   int ret;
    v_BOOL_t in_standby = TRUE;
 
    MTRACE(vos_trace(VOS_MODULE_ID_HDD, TRACE_CODE_HDD_OPEN_REQUEST,
                     pAdapter->sessionId, pAdapter->device_mode));
 
-   ret = wlan_hdd_validate_context(pHddCtx);
-   if (0 != ret) {
-       hddLog(LOGE, FL("HDD context is not valid"));
-       return ret;
+   /* Don't validate for load/unload and logp as if we return
+      failure we may endup in scan/connection related issues */
+   if (NULL == pHddCtx || NULL == pHddCtx->cfg_ini) {
+       hddLog(LOG1, FL("HDD context is Null"));
+       return -ENODEV;
    }
+
+   pHddCtx->driver_being_stopped = false;
 
    status = hdd_get_front_adapter (pHddCtx, &pAdapterNode);
    while ((NULL != pAdapterNode) && (VOS_STATUS_SUCCESS == status)) {
@@ -6904,7 +6910,7 @@ static int __hdd_open(struct net_device *dev)
        netif_tx_start_all_queues(dev);
    }
 
-   return ret;
+   return 0;
 }
 
 /**
@@ -7002,8 +7008,18 @@ static inline int wlan_hdd_stop_can_enter_lowpower(hdd_adapter_t *adapter)
  */
 static void kickstart_driver_handler(struct work_struct *work)
 {
+	bool ready;
+
+	ready = vos_is_load_unload_ready(__func__);
+	if (!ready) {
+		VOS_ASSERT(0);
+		return;
+	}
+
+	vos_load_unload_protect(__func__);
 	hdd_driver_exit();
 	wlan_hdd_inited = 0;
+	vos_load_unload_unprotect(__func__);
 }
 
 static DECLARE_WORK(kickstart_driver_work, kickstart_driver_handler);
@@ -7011,6 +7027,7 @@ static DECLARE_WORK(kickstart_driver_work, kickstart_driver_handler);
 /**
  * kickstart_driver() - Initialize and Clean-up driver
  * @load:	True: initialize, False: Clean-up driver
+ * @mode_change: tell if last mode and current mode is same or not
  *
  * Delayed driver initialization when driver is statically linked and Clean-up
  * when all the interfaces are down or any other condition which requires to
@@ -7022,12 +7039,13 @@ static DECLARE_WORK(kickstart_driver_work, kickstart_driver_handler);
  *
  * Return: 0 on success, non zero on failure
  */
-static int kickstart_driver(bool load)
+static int kickstart_driver(bool load, bool mode_change)
 {
 	int ret_status;
 
-	pr_info("%s: load: %d wlan_hdd_inited: %d, caller: %pf\n", __func__,
-			load, wlan_hdd_inited, (void *)_RET_IP_);
+	pr_info("%s: load: %d wlan_hdd_inited: %d, mode_change: %d caller: %pf\n",
+			 __func__, load, wlan_hdd_inited,
+			mode_change, (void *)_RET_IP_);
 
 	/* Make sure unload and load are synchronized */
 	flush_work(&kickstart_driver_work);
@@ -7048,12 +7066,20 @@ static int kickstart_driver(bool load)
 		return ret_status;
 	}
 
-	hdd_driver_exit();
+	if (load && wlan_hdd_inited && !mode_change) {
+		/* Error condition */
+		hdd_driver_exit();
+		wlan_hdd_inited = 0;
+		ret_status = -EINVAL;
+	} else {
+		hdd_driver_exit();
 
-	msleep(200);
+		msleep(200);
 
-	ret_status = hdd_driver_init();
-	wlan_hdd_inited = ret_status ? 0 : 1;
+		ret_status = hdd_driver_init();
+		wlan_hdd_inited = ret_status ? 0 : 1;
+	}
+
 	return ret_status;
 }
 
@@ -7066,7 +7092,22 @@ static int kickstart_driver(bool load)
  */
 static inline void wlan_hdd_stop_enter_lowpower(hdd_context_t *hdd_ctx)
 {
-	kickstart_driver(false);
+	bool ready;
+
+	/* Do not clean up n/w ifaces if we are in DRIVER STOP phase or else
+	 * DRIVER START will fail and Wi-Fi will not resume successfully
+	 */
+	if (hdd_ctx && !hdd_ctx->driver_being_stopped) {
+		ready = vos_is_load_unload_ready(__func__);
+		if (!ready) {
+			VOS_ASSERT(0);
+			return;
+		}
+
+		vos_load_unload_protect(__func__);
+		kickstart_driver(false, false);
+		vos_load_unload_unprotect(__func__);
+	}
 }
 
 /**
@@ -7076,10 +7117,27 @@ static inline void wlan_hdd_stop_enter_lowpower(hdd_context_t *hdd_ctx)
  * Check if hardware can enter low power mode when all the interfaces are down.
  * For static driver, hardware can enter low power mode for all types of
  * interfaces.
+ *
+ * Return: true for power save allowed and false for power save not allowed
  */
-static inline int wlan_hdd_stop_can_enter_lowpower(hdd_adapter_t *adapter)
+static inline bool wlan_hdd_stop_can_enter_lowpower(hdd_adapter_t *adapter)
 {
-	return 1;
+	hdd_context_t *hdd_ctx =  WLAN_HDD_GET_CTX(adapter);
+
+	/* In static driver case, we need to distinguish between WiFi OFF and
+	 * DRIVER STOP. In both cases "ifconfig down" is happening. In OFF case,
+	 * want to allow lowest power mode and driver cleanup. In case of DRIVER
+	 * STOP do not want to allow power collapse for GO/SAP case. STOP
+	 * behavior is now identical across both DLKM and Static driver case.
+	 */
+	if (hdd_ctx && !hdd_ctx->driver_being_stopped)
+		return true;
+	else if ((WLAN_HDD_SOFTAP == adapter->device_mode) ||
+		(WLAN_HDD_MONITOR == adapter->device_mode) ||
+		(WLAN_HDD_P2P_GO == adapter->device_mode))
+		return false;
+	else
+		return true;
 }
 #endif
 
@@ -7235,6 +7293,7 @@ static void __hdd_uninit(struct net_device *dev)
 	/* After uninit our adapter structure will no longer be valid */
       pAdapter->dev = NULL;
       pAdapter->magic = 0;
+      pAdapter->pHddCtx = NULL;
 
    EXIT();
 }
@@ -7669,6 +7728,33 @@ static eHalStatus hdd_smeCloseSessionCallback(void *pContext)
    }
 
    return eHAL_STATUS_SUCCESS;
+}
+
+/**
+ * hdd_close_tx_queues() - close tx queues
+ * @hdd_ctx: hdd global context
+ *
+ * Return: None
+ */
+static void hdd_close_tx_queues(hdd_context_t *hdd_ctx)
+{
+	VOS_STATUS status;
+	hdd_adapter_t *adapter;
+	hdd_adapter_list_node_t *adapter_node = NULL, *next_adapter = NULL;
+	/* Not validating hdd_ctx as it's already done by the caller */
+	ENTER();
+	status = hdd_get_front_adapter(hdd_ctx, &adapter_node);
+	while (NULL != adapter_node && VOS_STATUS_SUCCESS == status) {
+		adapter = adapter_node->pAdapter;
+		if (adapter && adapter->dev) {
+			netif_tx_disable (adapter->dev);
+			netif_carrier_off(adapter->dev);
+		}
+		status = hdd_get_next_adapter(hdd_ctx, adapter_node,
+						&next_adapter);
+		adapter_node = next_adapter;
+	}
+	EXIT();
 }
 
 VOS_STATUS hdd_init_station_mode( hdd_adapter_t *pAdapter )
@@ -10434,12 +10520,8 @@ free_hdd_ctx:
        pHddCtx->cfg_ini= NULL;
    }
 
-   /* FTM mode, WIPHY did not registered
-      If un-register here, system crash will happen */
-   if (VOS_FTM_MODE != hdd_get_conparam())
-   {
-      wiphy_unregister(wiphy) ;
-   }
+   wiphy_unregister(wiphy) ;
+   wlan_hdd_cfg80211_deinit(wiphy);
    wiphy_free(wiphy) ;
    if (hdd_is_ssr_required())
    {
@@ -10497,13 +10579,16 @@ void __hdd_wlan_exit(void)
    }
 
    pHddCtx->isUnloadInProgress = TRUE;
+   pHddCtx->driver_being_stopped = false;
 
    vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, TRUE);
+   vos_set_unload_in_progress(TRUE);
 
 #ifdef WLAN_FEATURE_LPSS
    wlan_hdd_send_status_pkg(NULL, NULL, 0, 0);
 #endif
 
+   hdd_close_tx_queues(pHddCtx);
    //Do all the cleanup before deregistering the driver
    hdd_wlan_exit(pHddCtx);
    EXIT();
@@ -11212,16 +11297,10 @@ int hdd_wlan_startup(struct device *dev, v_VOID_t *hif_sc)
    /*
     * cfg80211: Initialization  ...
     */
-#if !defined(LINUX_QCMBR)
-   if (VOS_FTM_MODE != hdd_get_conparam())
-#endif
-   {
-      if (0 < wlan_hdd_cfg80211_init(dev, wiphy, pHddCtx->cfg_ini))
-      {
-          hddLog(VOS_TRACE_LEVEL_FATAL,
+   if (0 < wlan_hdd_cfg80211_init(dev, wiphy, pHddCtx->cfg_ini)) {
+          hddLog(LOGE,
                  "%s: wlan_hdd_cfg80211_init return failure", __func__);
           goto err_config;
-      }
    }
 
    /* Initialize struct for saving f/w log setting will be used
@@ -11469,9 +11548,17 @@ int hdd_wlan_startup(struct device *dev, v_VOID_t *hif_sc)
           goto err_free_ftm_open;
       }
 #endif
+
+      /* registration of wiphy dev with cfg80211 */
+      if (0 > wlan_hdd_cfg80211_register(wiphy)) {
+          hddLog(LOGE, FL("wiphy register failed"));
+          goto err_free_ftm_open;
+      }
+
       vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, FALSE);
       pHddCtx->isLoadInProgress = FALSE;
-      hddLog(VOS_TRACE_LEVEL_FATAL,"%s: FTM driver loaded", __func__);
+
+      hddLog(LOGE, FL("FTM driver loaded"));
       complete(&wlan_start_comp);
       return VOS_STATUS_SUCCESS;
    }
@@ -11933,6 +12020,7 @@ err_vosstop:
 
 err_wiphy_unregister:
    wiphy_unregister(wiphy);
+   wlan_hdd_cfg80211_deinit(wiphy);
 
 err_vosclose:
    status = vos_sched_close( pVosContext );
@@ -12244,6 +12332,8 @@ static void hdd_driver_exit(void)
    }
    else
    {
+      pHddCtx->driver_being_stopped = false;
+
 #ifdef QCA_PKT_PROTO_TRACE
       vos_pkt_proto_trace_close();
 #endif /* QCA_PKT_PROTO_TRACE */
@@ -12260,8 +12350,11 @@ static void hdd_driver_exit(void)
          }
       }
 
+      rtnl_lock();
       pHddCtx->isUnloadInProgress = TRUE;
       vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, TRUE);
+      vos_set_unload_in_progress(TRUE);
+      rtnl_unlock();
    }
 
    vos_wait_for_work_thread_completion(__func__);
@@ -12330,12 +12423,37 @@ static int con_mode_handler(const char *kmessage,
 static int fwpath_changed_handler(const char *kmessage,
                                   struct kernel_param *kp)
 {
-   int ret;
+	int ret;
+	bool mode_change;
 
-   ret = param_set_copystring(kmessage, kp);
-   if (0 == ret)
-      ret = kickstart_driver(true);
-   return ret;
+	ret = param_set_copystring(kmessage, kp);
+
+	if (!ret) {
+		bool ready;
+
+		ret = strncmp(fwpath_mode_local, kmessage , 3);
+		mode_change = ret ? true : false;
+
+
+		pr_info("%s : new_mode : %s, present_mode : %s\n", __func__,
+			kmessage, fwpath_mode_local);
+
+		strlcpy(fwpath_mode_local, kmessage,
+			sizeof(fwpath_mode_local));
+
+		ready = vos_is_load_unload_ready(__func__);
+
+		if (!ready) {
+			VOS_ASSERT(0);
+			return -EINVAL;
+		}
+
+		vos_load_unload_protect(__func__);
+		ret = kickstart_driver(true, mode_change);
+		vos_load_unload_unprotect(__func__);
+	}
+
+	return ret;
 }
 
 #if ! defined(QCA_WIFI_FTM)
@@ -12358,7 +12476,7 @@ static int con_mode_handler(const char *kmessage, struct kernel_param *kp)
 
    ret = param_set_int(kmessage, kp);
    if (0 == ret)
-      ret = kickstart_driver(true);
+      ret = kickstart_driver(true, false);
    return ret;
 }
 #endif
