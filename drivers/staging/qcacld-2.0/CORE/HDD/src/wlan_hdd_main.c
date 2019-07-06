@@ -8876,8 +8876,12 @@ VOS_STATUS hdd_stop_adapter( hdd_context_t *pHddCtx, hdd_adapter_t *pAdapter,
          }
          else
          {
+#ifdef FEATURE_WLAN_SCAN_PNO
+            wlan_hdd_scan_abort(pAdapter);
+#else
             hdd_abort_mac_scan(pHddCtx, pAdapter->sessionId,
                                eCSR_SCAN_ABORT_DEFAULT);
+#endif
          }
          if (pAdapter->device_mode != WLAN_HDD_INFRA_STATION) {
              wlan_hdd_cleanup_remain_on_channel_ctx(pAdapter);
@@ -11218,6 +11222,7 @@ int hdd_wlan_startup(struct device *dev, v_VOID_t *hif_sc)
    hddLog(VOS_TRACE_LEVEL_INFO, "Setting configuredMcastBcastFilter: %d",
                    pHddCtx->cfg_ini->mcastBcastFilterSetting);
 
+   vos_set_fatal_event(pHddCtx->cfg_ini->enable_fatal_event);
    if (false == hdd_is_5g_supported(pHddCtx))
    {
       //5Ghz is not supported.
@@ -12941,6 +12946,8 @@ VOS_STATUS wlan_hdd_restart_driver(hdd_context_t *pHddCtx)
    /* Send reset FIQ to WCNSS to invoke SSR. */
 #ifdef HAVE_WCNSS_RESET_INTR
    wcnss_reset_intr();
+#else /* apq8084 does not compile with WCNSS */
+   VOS_BUG(0);
 #endif
 
    return status;

@@ -38,6 +38,7 @@
 #include <linux/slab.h>
 #include <linux/pid_namespace.h>
 #include <linux/security.h>
+#include <linux/ratelimit.h>
 
 #include "binder.h"
 #include "binder_trace.h"
@@ -139,7 +140,7 @@ module_param_call(stop_on_user_error, binder_set_stop_on_user_error,
 #define binder_debug(mask, x...) \
 	do { \
 		if (binder_debug_mask & mask) \
-			pr_info(x); \
+			pr_info_ratelimited(x); \
 	} while (0)
 
 #define binder_user_error(x...) \
@@ -2500,10 +2501,8 @@ static int binder_thread_write(struct binder_proc *proc,
 				BUG_ON(!buffer->target_node->has_async_transaction);
 				if (list_empty(&buffer->target_node->async_todo))
 					buffer->target_node->has_async_transaction = 0;
-				else {
-					list_move_tail(buffer->target_node->async_todo.next, &thread->proc->todo);
-					wake_up_interruptible(&thread->proc->wait);
-				}
+				else
+					list_move_tail(buffer->target_node->async_todo.next, &thread->todo);
 			}
 			trace_binder_transaction_buffer_release(buffer);
 			binder_transaction_buffer_release(proc, buffer, NULL);
@@ -3420,7 +3419,7 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 		goto err_already_mapped;
 	}
 
-	area = get_vm_area(vma->vm_end - vma->vm_start, VM_IOREMAP);
+	area = get_vm_area(vma->vm_end - vma->vm_start, VM_ALLOC);
 	if (area == NULL) {
 		ret = -ENOMEM;
 		failure_string = "get_vm_area";
@@ -3520,10 +3519,10 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	INIT_LIST_HEAD(&proc->todo);
 	init_waitqueue_head(&proc->wait);
 	proc->default_priority = task_nice(current);
-	INIT_LIST_HEAD(&proc->buffers);
 	binder_dev = container_of(filp->private_data, struct binder_device,
 				  miscdev);
 	proc->context = &binder_dev->context;
+	INIT_LIST_HEAD(&proc->buffers);
 
 	binder_lock(__func__);
 

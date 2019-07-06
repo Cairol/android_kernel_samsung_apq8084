@@ -2641,7 +2641,7 @@ static int wma_stats_event_handler(void *handle, u_int8_t *cmd_param_info,
 	} while (0);
 
 	if (excess_data ||
-	    (sizeof(*event) > WMA_SVC_MSG_MAX_SIZE - buf_len)) {
+	    (buf_len > WMA_SVC_MSG_MAX_SIZE - sizeof(*event))) {
 		WMA_LOGE("excess wmi buffer: stats pdev %d vdev %d peer %d",
 			event->num_pdev_stats, event->num_vdev_stats,
 			event->num_peer_stats);
@@ -3418,6 +3418,17 @@ static int wma_group_num_bss_to_scan_id(const u_int8_t *cmd_param_info,
 	src_rssi = param_buf->rssi_list;
 	t_cached_result = cached_result;
 	t_scan_id_grp = &t_cached_result->result[0];
+
+	if ((t_cached_result->num_scan_ids *
+	    MIN(t_scan_id_grp->num_results,
+		param_buf->num_bssid_list)) > param_buf->num_bssid_list) {
+		WMA_LOGE("%s:num_scan_ids %d, num_results %d num_bssid_list %d",
+			 __func__,
+			 t_cached_result->num_scan_ids,
+			 t_scan_id_grp->num_results,
+			 param_buf->num_bssid_list);
+		return -EINVAL;
+	}
 
 	WMA_LOGD("%s: num_scan_ids:%d", __func__,
 			t_cached_result->num_scan_ids);
@@ -21403,8 +21414,12 @@ static VOS_STATUS wma_process_mcbc_set_filter_req(tp_wma_handle wma_handle,
 	uint8_t vdev_id = 0;
 	int i;
 
-	if(mcbc_param->ulMulticastAddrCnt <= 0) {
-		WMA_LOGW("Number of multicast addresses is 0");
+	if (mcbc_param->ulMulticastAddrCnt <= 0 ||
+		mcbc_param->ulMulticastAddrCnt >
+			CFG_TGT_MAX_MULTICAST_FILTER_ENTRIES) {
+		WMA_LOGE("Number of multicast addresses is: %u",
+				mcbc_param->ulMulticastAddrCnt);
+		WARN_ON(1);
 		return VOS_STATUS_E_FAILURE;
 	}
 

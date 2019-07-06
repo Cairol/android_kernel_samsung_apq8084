@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2015 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2016 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -60,9 +60,8 @@
 #include <linux/kthread.h>
 #include <linux/cpu.h>
 #include <linux/topology.h>
-#if defined(QCA_CONFIG_SMP) && defined(CONFIG_CNSS)
-#include <net/cnss.h>
-#endif
+#include "vos_cnss.h"
+
 /*---------------------------------------------------------------------------
  * Preprocessor Definitions and Constants
  * ------------------------------------------------------------------------*/
@@ -76,6 +75,10 @@
 #define MAX_SSR_WAIT_ITERATIONS 100
 #define MAX_LOAD_UNLOAD_WAIT_ITERATIONS 50
 #define MAX_SSR_PROTECT_LOG (16)
+
+/* Timer value for detecting thread stuck issues */
+#define THREAD_STUCK_TIMER_VAL 10000 /* 10 seconds */
+#define THREAD_STUCK_THRESHOLD 1
 
 static atomic_t ssr_protect_entry_count;
 static atomic_t load_unload_protect_count;
@@ -748,6 +751,7 @@ VOS_STATUS vos_watchdog_open
 
   // Initialize the lock
   spin_lock_init(&pWdContext->wdLock);
+  spin_lock_init(&pWdContext->thread_stuck_lock);
 
   //Create the Watchdog thread
   pWdContext->WdThread = kthread_create(VosWDThread, pWdContext,"VosWDThread");
@@ -1041,6 +1045,100 @@ v_BOOL_t isWDresetInProgress(void)
       return FALSE;
    }
 }
+
+ /**
+ * vos_wd_detect_thread_stuck()- Detect thread stuck
+ * by probing MC thread and take action if Thread doesnt respond.
+ *
+ * This function is called to detect thread stuck
+ * and probe threads.
+ *
+ * Return: void
+ */
+static void vos_wd_detect_thread_stuck(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&gpVosWatchdogContext->thread_stuck_lock, flags);
+
+	if (gpVosWatchdogContext->mc_thread_stuck_count ==
+				THREAD_STUCK_THRESHOLD) {
+		spin_unlock_irqrestore(&gpVosWatchdogContext->thread_stuck_lock,
+				flags);
+		hddLog(LOGE, FL("MC Thread Stuck!!!"));
+
+		vos_dump_stack(gpVosSchedContext->McThread);
+		vos_flush_logs(WLAN_LOG_TYPE_FATAL,
+			       WLAN_LOG_INDICATOR_HOST_ONLY,
+			       WLAN_LOG_REASON_THREAD_STUCK,
+			       true);
+		spin_lock_irqsave(&gpVosWatchdogContext->thread_stuck_lock,
+			flags);
+	}
+
+	if (!gpVosWatchdogContext->mc_thread_stuck_count) {
+		spin_unlock_irqrestore(&gpVosWatchdogContext->thread_stuck_lock,
+				flags);
+		vos_probe_threads();
+		spin_lock_irqsave(&gpVosWatchdogContext->thread_stuck_lock,
+				flags);
+	}
+
+	/* Increment the thread stuck count for all threads */
+	gpVosWatchdogContext->mc_thread_stuck_count++;
+
+	spin_unlock_irqrestore(&gpVosWatchdogContext->thread_stuck_lock, flags);
+
+	/* Restart the timer */
+	if (VOS_STATUS_SUCCESS !=
+		    vos_timer_start(&gpVosWatchdogContext->thread_stuck_timer,
+				THREAD_STUCK_TIMER_VAL))
+		hddLog(LOGE, FL("Unable to start thread stuck timer"));
+}
+
+ /**
+ * vos_wd_detect_thread_stuck_cb()- Call back of the
+ * thread stuck timer.
+ * @priv: timer data.
+ * This function is called when the thread stuck timer
+ * expire to detect thread stuck and probe threads.
+ *
+ * Return: void
+ */
+static void vos_wd_detect_thread_stuck_cb(void *priv)
+{
+	if (!(vos_is_logp_in_progress(VOS_MODULE_ID_SYS, NULL) ||
+				vos_is_load_unload_in_progress(VOS_MODULE_ID_SYS
+					, NULL))) {
+		set_bit(WD_WLAN_DETECT_THREAD_STUCK_MASK,
+				&gpVosWatchdogContext->wdEventFlag);
+		set_bit(WD_POST_EVENT_MASK, &gpVosWatchdogContext->wdEventFlag);
+		wake_up_interruptible(&gpVosWatchdogContext->wdWaitQueue);
+	}
+}
+
+/**
+ * vos_wd_reset_thread_stuck_count()- Callback to
+ * probe msg sent to Threads.
+ *
+ * @thread_id: passed threadid
+ *
+ * This function is called to by the thread after
+ * processing the probe msg, with their own thread id.
+ *
+ * Return: void.
+ */
+void vos_wd_reset_thread_stuck_count(int thread_id)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&gpVosWatchdogContext->thread_stuck_lock, flags);
+	if (vos_sched_is_mc_thread(thread_id))
+		gpVosWatchdogContext->mc_thread_stuck_count = 0;
+
+	spin_unlock_irqrestore(&gpVosWatchdogContext->thread_stuck_lock, flags);
+}
+
 /*---------------------------------------------------------------------------
   \brief VosWdThread() - The VOSS Watchdog thread
   The \a VosWdThread() is the Watchdog thread:
@@ -1071,6 +1169,21 @@ VosWDThread
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0))
   daemonize("WD_Thread");
 #endif
+  /* Initialize the timer to detect thread stuck issues */
+  if (vos_timer_init(&gpVosWatchdogContext->thread_stuck_timer,
+        VOS_TIMER_TYPE_SW, vos_wd_detect_thread_stuck_cb, NULL)) {
+      VOS_TRACE(VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_ERROR,
+                "Unable to initialize thread stuck timer");
+  } else {
+      if (VOS_STATUS_SUCCESS !=
+              vos_timer_start(&gpVosWatchdogContext->thread_stuck_timer,
+                           THREAD_STUCK_TIMER_VAL))
+          VOS_TRACE(VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_ERROR,
+                        "Unable to start thread stuck timer");
+      else
+          VOS_TRACE(VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_INFO,
+                        "Successfully started thread stuck timer");
+  }
 
   /*
   ** Ack back to the context from which the Watchdog thread has been
@@ -1094,6 +1207,22 @@ VosWDThread
     clear_bit(WD_POST_EVENT_MASK, &pWdContext->wdEventFlag);
     while(1)
     {
+      /* Post Msg to detect thread stuck */
+      if (test_and_clear_bit(WD_WLAN_DETECT_THREAD_STUCK_MASK,
+                                   &pWdContext->wdEventFlag)) {
+
+       if (!test_bit(MC_SUSPEND_EVENT_MASK, &gpVosSchedContext->mcEventFlag))
+            vos_wd_detect_thread_stuck();
+       else
+            VOS_TRACE(VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_INFO,
+               "%s: controller thread %s id: %d is suspended do not attemp probing",
+               __func__, current->comm, current->pid);
+        /*
+         * Process here and return without processing any SSR
+         * related logic.
+         */
+        break;
+      }
       /* Check for any Active Entry Points
        * If active, delay SSR until no entry point is active or
        * delay until count is decremented to ZERO
@@ -1187,6 +1316,7 @@ VosWDThread
     } // while message loop processing
   } // while shutdown
 
+  vos_timer_destroy(&pWdContext->thread_stuck_timer);
   // If we get here the Watchdog thread must exit
   VOS_TRACE( VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_INFO,
       "%s: Watchdog Thread exiting !!!!", __func__);
@@ -2244,6 +2374,32 @@ pVosSchedContext get_vos_sched_ctxt(void)
    }
    return (gpVosSchedContext);
 }
+
+
+/**
+ * vos_is_mc_thread()- Check if threadid is
+ * of mc thread
+ *
+ * @thread_id: passed threadid
+ * This function is called to check if threadid is
+ * of mc thread.
+ *
+ * Return: true if threadid is of mc thread.
+ */
+int vos_sched_is_mc_thread(int thread_id)
+{
+	/* Make sure that Vos Scheduler context has been initialized */
+	VOS_ASSERT(NULL != gpVosSchedContext);
+	if (gpVosSchedContext == NULL) {
+		VOS_TRACE(VOS_MODULE_ID_VOSS, VOS_TRACE_LEVEL_ERROR,
+				"%s: gpVosSchedContext == NULL", __func__);
+		return 0;
+	}
+	return ((gpVosSchedContext->McThread) &&
+			(thread_id ==
+			 gpVosSchedContext->McThread->pid));
+}
+
 /*-------------------------------------------------------------------------
  Helper function to get the watchdog context
  ------------------------------------------------------------------------*/
@@ -2569,6 +2725,29 @@ void vos_ssr_unprotect(const char *caller_func)
    if (!status)
        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
            "Untracked call %s", caller_func);
+}
+
+/**
+ * vos_is_wd_thread()- Check if threadid is
+ * of Watchdog thread
+ *
+ * @thread_id: passed threadid
+ * This function is called to check if threadid is
+ * of wd thread.
+ *
+ * Return: true if threadid is of wd thread.
+ */
+bool vos_is_wd_thread(int thread_id)
+{
+	/*
+	 * Make sure that Vos Watchdong Scheduler context
+	 * has been initialized
+	 */
+	if (NULL == gpVosWatchdogContext)
+		return 0;
+
+	return ((gpVosWatchdogContext->WdThread) &&
+			(thread_id == gpVosWatchdogContext->WdThread->pid));
 }
 
 /**
