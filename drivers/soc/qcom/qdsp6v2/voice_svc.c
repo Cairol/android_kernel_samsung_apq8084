@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
+#include <linux/spinlock.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
@@ -62,7 +63,19 @@ struct apr_response_list {
 
 static struct voice_svc_device *voice_svc_dev;
 static struct class *voice_svc_class;
+static bool reg_dummy_sess;
+static void *dummy_q6_mvm;
+static void *dummy_q6_cvs;
 dev_t device_num;
+
+static struct mutex session_lock;
+spinlock_t voicesvc_lock;
+static bool is_released = 1;
+static int voice_svc_dummy_reg(void);
+static int voice_svc_dummy_dereg(void);
+
+static int32_t qdsp_dummy_apr_callback(struct apr_client_data *data,
+					void *priv);
 
 static int32_t qdsp_apr_callback(struct apr_client_data *data, void *priv)
 {
@@ -75,10 +88,16 @@ static int32_t qdsp_apr_callback(struct apr_client_data *data, void *priv)
 
 		return -EINVAL;
 	}
+	spin_lock(&voicesvc_lock);
+	if (is_released) {
+		spin_unlock(&voicesvc_lock);
+		return 0;
+	}
 
 	prtd = (struct voice_svc_prvt *)priv;
 	if (prtd == NULL) {
 		pr_err("%s: private data is NULL\n", __func__);
+		spin_unlock(&voicesvc_lock);
 
 		return -EINVAL;
 	}
@@ -114,6 +133,7 @@ static int32_t qdsp_apr_callback(struct apr_client_data *data, void *priv)
 
 			spin_unlock_irqrestore(&prtd->response_lock,
 					       spin_flags);
+			spin_unlock(&voicesvc_lock);
 			return -ENOMEM;
 		}
 
@@ -142,6 +162,13 @@ static int32_t qdsp_apr_callback(struct apr_client_data *data, void *priv)
 		       __func__);
 	}
 
+	spin_unlock(&voicesvc_lock);
+	return 0;
+}
+
+static int32_t qdsp_dummy_apr_callback(struct apr_client_data *data, void *priv)
+{
+	/* Do Nothing */
 	return 0;
 }
 
@@ -247,6 +274,13 @@ static int voice_svc_reg(char *svc, uint32_t src_port,
 
 	if (*handle != NULL) {
 		pr_err("%s: svc handle not NULL\n", __func__);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	if (src_port == (APR_MAX_PORTS - 1)) {
+		pr_err("%s: SRC port reserved for dummy session\n", __func__);
+		pr_err("%s: Unable to register %s\n", __func__, svc);
 		ret = -EINVAL;
 		goto done;
 	}
@@ -556,17 +590,72 @@ done:
 	return ret;
 }
 
+static int voice_svc_dummy_reg()
+{
+	uint32_t src_port = APR_MAX_PORTS - 1;
+
+	pr_debug("%s\n", __func__);
+	dummy_q6_mvm = apr_register("ADSP", "MVM",
+				qdsp_dummy_apr_callback,
+				src_port,
+				NULL);
+	if (dummy_q6_mvm == NULL) {
+		pr_err("%s: Unable to register dummy MVM\n", __func__);
+		goto err;
+	}
+
+	dummy_q6_cvs = apr_register("ADSP", "CVS",
+				qdsp_dummy_apr_callback,
+				src_port,
+				NULL);
+	if (dummy_q6_cvs == NULL) {
+		pr_err("%s: Unable to register dummy CVS\n", __func__);
+		goto err;
+	}
+	return 0;
+err:
+	if (dummy_q6_mvm != NULL) {
+		apr_deregister(dummy_q6_mvm);
+		dummy_q6_mvm = NULL;
+	}
+	return -EINVAL;
+}
+
+static int voice_svc_dummy_dereg(void)
+{
+	pr_debug("%s\n", __func__);
+	if (dummy_q6_mvm != NULL) {
+		apr_deregister(dummy_q6_mvm);
+		dummy_q6_mvm = NULL;
+	}
+
+	if (dummy_q6_cvs != NULL) {
+		apr_deregister(dummy_q6_cvs);
+		dummy_q6_cvs = NULL;
+	}
+	return 0;
+}
+
 static int voice_svc_open(struct inode *inode, struct file *file)
 {
 	struct voice_svc_prvt *prtd = NULL;
+	int ret = 0;
 
 	pr_debug("%s\n", __func__);
+
+	mutex_lock(&session_lock);
+	if (is_released == 0) {
+		pr_err("%s: Access denied to device\n", __func__);
+		ret = -EBUSY;
+		goto done;
+	}
 
 	prtd = kmalloc(sizeof(struct voice_svc_prvt), GFP_KERNEL);
 
 	if (prtd == NULL) {
 		pr_err("%s: kmalloc failed\n", __func__);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto done;
 	}
 
 	memset(prtd, 0, sizeof(struct voice_svc_prvt));
@@ -579,7 +668,20 @@ static int voice_svc_open(struct inode *inode, struct file *file)
 	mutex_init(&prtd->response_mutex_lock);
 	file->private_data = (void *)prtd;
 
-	return 0;
+	is_released = 0;
+	/* Current APR implementation doesn't support session based
+	 * multiple service registrations. The apr_deregister()
+	 * function sets the destination and client IDs to zero, if
+	 * deregister is called for a single service instance.
+	 * To avoid this, register for additional services.
+	 */
+	if (!reg_dummy_sess) {
+		voice_svc_dummy_reg();
+		reg_dummy_sess = 1;
+	}
+done:
+	mutex_unlock(&session_lock);
+	return ret;
 }
 
 static int voice_svc_release(struct inode *inode, struct file *file)
@@ -601,6 +703,11 @@ static int voice_svc_release(struct inode *inode, struct file *file)
 		goto done;
 	}
 
+	mutex_lock(&prtd->response_mutex_lock);
+	if (reg_dummy_sess) {
+		voice_svc_dummy_dereg();
+		reg_dummy_sess = 0;
+	}
 	if (prtd->apr_q6_cvs != NULL) {
 		svc_name = VOICE_SVC_MVM_STR;
 		handle = &prtd->apr_q6_cvs;
@@ -617,7 +724,6 @@ static int voice_svc_release(struct inode *inode, struct file *file)
 			pr_err("%s: Failed to dereg MVM %d\n", __func__, ret);
 	}
 
-	mutex_lock(&prtd->response_mutex_lock);
 	spin_lock_irqsave(&prtd->response_lock, spin_flags);
 
 	while (!list_empty(&prtd->response_queue)) {
@@ -635,9 +741,11 @@ static int voice_svc_release(struct inode *inode, struct file *file)
 
 	mutex_destroy(&prtd->response_mutex_lock);
 
+	spin_lock(&voicesvc_lock);
 	kfree(file->private_data);
 	file->private_data = NULL;
-
+	is_released = 1;
+	spin_unlock(&voicesvc_lock);
 done:
 	return ret;
 }
@@ -700,6 +808,8 @@ static int voice_svc_probe(struct platform_device *pdev)
 		goto add_err;
 	}
 	pr_debug("%s: Device created\n", __func__);
+	spin_lock_init(&voicesvc_lock);
+	mutex_init(&session_lock);
 	goto done;
 
 add_err:
@@ -721,6 +831,7 @@ static int voice_svc_remove(struct platform_device *pdev)
 	kfree(voice_svc_dev->cdev);
 	device_destroy(voice_svc_class, device_num);
 	class_destroy(voice_svc_class);
+	mutex_destroy(&session_lock);
 	unregister_chrdev_region(0, MINOR_NUMBER);
 
 	return 0;
