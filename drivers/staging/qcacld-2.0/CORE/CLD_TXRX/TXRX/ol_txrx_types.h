@@ -922,6 +922,9 @@ struct ol_txrx_peer_t {
 	u_int32_t rmf_pn_replays;
 	u_int8_t last_rmf_pn_valid;
 #endif
+
+	adf_os_time_t last_assoc_rcvd;
+	adf_os_time_t last_disassoc_deauth_rcvd;
 };
 
 struct ol_fw_data {
